@@ -5,6 +5,9 @@
 // host that embeds campus.html the way Campus does.
 //
 //   node scripts/serve.mjs [port]      (PORT=... works too)
+//   node scripts/serve.mjs stop        ends the server this checkout started
+//
+// While it runs, .obeya/run/app.json holds its address (url) and pid.
 
 import fs from 'node:fs';
 import http from 'node:http';
@@ -13,6 +16,20 @@ import { fileURLToPath } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = path.join(REPO, 'dist');
+const RUN_FILE = path.join(REPO, '.obeya', 'run', 'app.json');
+
+if (process.argv[2] === 'stop') {
+	try {
+		const { pid } = JSON.parse(fs.readFileSync(RUN_FILE, 'utf8'));
+		process.kill(pid);
+		console.log(`stopped the server (pid ${pid})`);
+	} catch {
+		// nothing running from this checkout
+	}
+	fs.rmSync(RUN_FILE, { force: true });
+	process.exit(0);
+}
+
 const PORT = Number(process.argv[2] || process.env.PORT || 8610);
 
 const TYPES = {
@@ -62,4 +79,16 @@ http
 			res.end(data);
 		});
 	})
-	.listen(PORT, () => console.log(`Snap! for Calliope Campus: http://localhost:${PORT}/campus.html`));
+	.listen(PORT, () => {
+		const url = `http://localhost:${PORT}/`;
+		fs.mkdirSync(path.dirname(RUN_FILE), { recursive: true });
+		fs.writeFileSync(RUN_FILE, JSON.stringify({ url, pid: process.pid }, null, 2) + '\n');
+		console.log(`Snap! for Calliope Campus: ${url}campus.html (test host: ${url}dev/host.html)`);
+	});
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+	process.on(signal, () => {
+		fs.rmSync(RUN_FILE, { force: true });
+		process.exit(0);
+	});
+}

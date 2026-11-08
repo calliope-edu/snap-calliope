@@ -1,0 +1,18 @@
+{
+	"checks": [
+		"node --check calliope/calliope.js",
+		"node --check bridge/campus.js",
+		"node --check bridge/render.js",
+		"npm run library",
+		"git diff --exit-code -- calliope/calliope_module.xml calliope/template.xml"
+	],
+	"direct": true,
+	"language": "en",
+	"app": {
+		"run": "A static site, no dependencies to install (Node 18+). `npm run build` downloads the Snap! release once into `.cache/` (~130 MB, a minute on a first run) and builds `dist/`; run it again after every change to `bridge/`, `pages/` or `calliope/`, then reload the page (the server needs no restart). Serve it with `node scripts/serve.mjs` (with run_in_background) on port 8610; it writes its address to `.obeya/run/app.json` (field `url`). Port 8610 is what Calliope Campus' editor preset for Snap! points at, so only one workspace serves at a time: if the port is taken, pass another (`node scripts/serve.mjs 8611`) and set that URL in Campus' room settings (debug mode, editor URLs). Open `<url>campus.html` for Snap! with the Calliope mini library on its own, or `<url>dev/host.html` for a test host that embeds it the way Campus does, logs every message and plays a Calliope mini (buttons: connect, button A, read only, active). To show it inside Campus, run Campus from a calliope-campus workspace as its settings say (`node .obeya/app.mjs start`), switch debug mode on, enable the editor Snap! in a room and create a Snap! program. No login here. Stop it with `node scripts/serve.mjs stop`.",
+		"stop": "node scripts/serve.mjs stop"
+	},
+	"demo": {
+		"language": "de"
+	}
+}

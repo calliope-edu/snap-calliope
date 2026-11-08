@@ -24,7 +24,7 @@
 
     var SOURCE = 'snap-calliope-render',
         TEMPLATE = 'libraries/calliope/template.xml',
-        MAX_SIDE = 1600, // px; larger pictures are scaled down
+        MAX_SIDE = 2400, // px; larger pictures are scaled down
         PADDING = 8,
         params = new URLSearchParams(location.search),
         world,
@@ -110,6 +110,7 @@
             noExitWarning: true,
             noDevWarning: true,
             noUserSettings: true,
+            blocksZoom: 2, // crisp when a view scales the picture up
             load: TEMPLATE,
             onload: () => {
                 ready = true;

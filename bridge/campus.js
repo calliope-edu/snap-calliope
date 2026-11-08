@@ -8,7 +8,8 @@
 
     The host passes ?parentOrigin=<its origin> in the URL. Messages from any
     other window or origin are ignored, and messages go out to that origin
-    only.
+    only. A host without an origin of its own (a room export opened from
+    disk) passes "*": then the parent window counts, whatever its origin.
 
     host -> Snap!
         {type: 'snap.load', xml, key}     open a project; an empty xml opens
@@ -242,7 +243,7 @@ SnapExtensions*/
     window.addEventListener('message', event => {
         var data = event.data;
         if (!embedded || event.source !== window.parent ||
-                event.origin !== parentOrigin) {
+                (parentOrigin !== '*' && event.origin !== parentOrigin)) {
             return;
         }
         if (!data || typeof data !== 'object' ||

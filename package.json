@@ -3,7 +3,6 @@
   "private": true,
   "description": "Snap! with the Calliope mini library, as a static build for Calliope Campus",
   "license": "AGPL-3.0-or-later",
-  "type": "module",
   "snapVersion": "12.3.11",
   "scripts": {
     "build": "node scripts/build.mjs",

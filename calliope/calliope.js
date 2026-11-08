@@ -461,7 +461,8 @@
 
     RemoteTransport.prototype.receive = function (event) {
         var data = event.data, resolve, cb;
-        if (event.source !== window.parent || event.origin !== this.origin) {
+        if (event.source !== window.parent ||
+                (this.origin !== '*' && event.origin !== this.origin)) {
             return;
         }
         if (!data || typeof data !== 'object' ||
