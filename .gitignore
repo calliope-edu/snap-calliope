@@ -1,0 +1,27 @@
+# Build output
+dist/
+build/
+out/
+target/
+*.log
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+vendor/
+
+# Secrets
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# The system's own
+.DS_Store
+Thumbs.db
