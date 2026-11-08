@@ -25,3 +25,11 @@ id_ed25519*
 # The system's own
 .DS_Store
 Thumbs.db
+
+# Snap! release download cache (scripts/build.mjs)
+.cache/
+
+# Obeya runtime files and local scratch folders
+.obeya/run/
+downloads/
+screenshots/
