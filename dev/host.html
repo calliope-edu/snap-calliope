@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>snap-calliope test host</title>
+<!--
+    A stand-in for Calliope Campus, served by scripts/serve.mjs at
+    /dev/host.html (not part of the build). It embeds campus.html the way
+    Campus does, logs every message, and plays a Calliope mini running the
+    Blocks program: it answers calliope.read and can send button events.
+-->
+<style>
+    body { margin: 0; font: 14px system-ui, sans-serif; display: grid;
+        grid-template-columns: 1fr 340px; height: 100vh; }
+    iframe { border: 0; width: 100%; height: 100%; }
+    aside { border-left: 1px solid #ccc; padding: 8px; overflow: auto; }
+    button { margin: 2px; }
+    pre { font-size: 11px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<iframe id="snap"></iframe>
+<aside>
+    <div>
+        <button id="connect">Gerät verbinden</button>
+        <button id="disconnect">Gerät trennen</button>
+        <button id="buttonA">Taste A klicken</button>
+        <button id="loadEmpty">Neues Programm</button>
+        <button id="readonly">Nur lesen an/aus</button>
+        <button id="active">Aktiv an/aus</button>
+    </div>
+    <pre id="log"></pre>
+</aside>
+<script>
+    const frame = document.getElementById('snap');
+    const origin = location.origin;
+    frame.src = `${origin}/campus.html?instance=test&parentOrigin=${encodeURIComponent(origin)}`;
+    const SERVICE = '0b50f3e4-607f-4151-9091-7d008d6ffc5c';
+    const uuid = (ch) => `0b50${ch.toString(16).padStart(4, '0')}-607f-4151-9091-7d008d6ffc5c`;
+    const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
+    let connected = false, readonly = false, active = true;
+    const subscribed = new Set();
+    window.messages = [];
+
+    function log(dir, msg) {
+        window.messages.push({ dir, msg });
+        if (msg.type === 'calliope.read' || msg.type === 'calliope.readResult') return;
+        const text = JSON.stringify(msg, (k, v) => (k === 'xml' && v ? `<${v.length} chars>` : v));
+        document.getElementById('log').textContent = `${dir} ${text}\n` + document.getElementById('log').textContent;
+    }
+    function send(msg) {
+        log('→', msg);
+        frame.contentWindow.postMessage(msg, origin);
+    }
+    function answer(ch) {
+        if (!connected) return [];
+        if (ch === 0x0100) return [2, 2, 0, 2, 0]; // mini 3, protocol 2, BLE, runtime v2
+        if (ch === 0x0101) return [0, 0, 0, 0, 120, 128 + 21, 10];
+        if (ch === 0x0102) return new Array(18).fill(0);
+        if (ch === 0x0120) return [0, 2, 0, 1, 0, 0, 0, 0];
+        return [];
+    }
+    window.addEventListener('message', (event) => {
+        if (event.source !== frame.contentWindow) return;
+        const msg = event.data;
+        log('←', msg);
+        if (msg.type === 'snap.ready') send({ type: 'snap.load', xml: window.programXml || '', key: 'p1' });
+        if (msg.type === 'snap.changed' || msg.type === 'snap.save') window.programXml = msg.xml;
+        if (msg.type === 'calliope.read') {
+            const ch = parseInt(String(msg.characteristicId).slice(4, 8), 16);
+            frame.contentWindow.postMessage({ source: 'calliope-host', type: 'calliope.readResult',
+                reqId: msg.reqId, message: b64(answer(ch)), encoding: 'base64' }, origin);
+        }
+        if (msg.type === 'calliope.subscribe') subscribed.add(msg.characteristicId);
+    });
+    document.getElementById('connect').onclick = () => {
+        connected = true;
+        send({ type: 'calliope.connection', connected: true });
+    };
+    document.getElementById('disconnect').onclick = () => {
+        connected = false;
+        send({ type: 'calliope.connection', connected: false });
+    };
+    document.getElementById('buttonA').onclick = window.pressA = () => {
+        const data = new Array(20).fill(0);
+        data[0] = 1; data[1] = 1; data[3] = 3; data[19] = 0x12; // button A clicked
+        send({ source: 'calliope-host', type: 'calliope.notify', serviceId: SERVICE,
+            characteristicId: uuid(0x0110), message: b64(data), encoding: 'base64' });
+    };
+    document.getElementById('loadEmpty').onclick = () => send({ type: 'snap.load', xml: '', key: 'p2' });
+    document.getElementById('readonly').onclick = () => send({ type: 'snap.readonly', readonly: (readonly = !readonly) });
+    document.getElementById('active').onclick = () => {
+        active = !active;
+        send({ type: 'snap.setActive', active });
+        send({ type: 'calliope.setActive', active });
+    };
+</script>
+</body>
+</html>

@@ -5,9 +5,26 @@
     Talks to the Calliope mini Blocks firmware (https://calliope.cc/programmieren/editoren/calliope-mini-blocks-scratch-programmieren) via
       - Web Bluetooth (GATT service 0b50f3e4-...)
       - Web Serial (USB, framed protocol of the same firmware)
+      - a host page (RemoteTransport), when Snap! runs embedded in
+        Calliope Campus: every GATT access goes to the parent window as
+        calliope.read/write/subscribe/unsubscribe postMessages, in the
+        format Campus already speaks with the Blocks editor
+        (src/lib/blocks/calliopeRemoteHost.ts). The host owns the
+        connection; the blocks "connect"/"disconnect" only mirror it.
+
+    The remote mode is on when a parent origin is known: either the page's
+    own URL has ?parentOrigin=..., or a same-origin wrapper page (campus.html
+    of snap-calliope) sets window.SnapCalliopeHost = {parentOrigin}. Without
+    one, Bluetooth and USB work as before, so snap.schule can use this very
+    file unchanged.
 
     Protocol and logic follow the Calliope mini extension of
-    https://github.com/calliope-edu/Scratch-more-v3 (scratch-vm/src/extensions/calliopeMini).
+    https://github.com/calliope-edu/Scratch-more-v3 (scratch-vm/src/extensions/calliopeMini)
+    and its successor in https://github.com/calliope-edu/blocks: the
+    consolidated firmware protocol carries pin, button, gesture and data
+    events on one characteristic (0x0110) and all analog pins packed into
+    one read (0x0120); the older per-event characteristics are still used
+    when a device offers them.
 
     Requires a Chromium based browser (Chrome, Edge, Chromebook).
 
@@ -32,11 +49,17 @@
             COMMAND: 0x0100,
             STATE: 0x0101,
             MOTION: 0x0102,
+            // consolidated firmware: pin, action and data events on 0x0110
             PIN_EVENT: 0x0110,
+            // older firmware only: separate action and message events
             ACTION_EVENT: 0x0111,
-            ANALOG_IN: [0x0120, 0x0121, 0x0122],
-            MESSAGE: 0x0130
+            MESSAGE: 0x0130,
+            // consolidated firmware: P0..P3 as uint16 LE at offsets 0/2/4/6
+            // of 0x0120; older firmware: one characteristic per pin
+            ANALOG_IN: [0x0120, 0x0121, 0x0122]
         },
+        // what the consolidated firmware (and so the Campus host) offers
+        CONSOLIDATED = [0x0100, 0x0101, 0x0102, 0x0110, 0x0120],
         CMD = {
             CONFIG: 0x00,
             PIN: 0x01,
@@ -198,6 +221,10 @@
         return this.enqueue(() => c.startNotifications());
     };
 
+    BleTransport.prototype.has = function (ch) {
+        return !!this.chars[ch];
+    };
+
     BleTransport.prototype.pending = function () {
         return 0;
     };
@@ -339,6 +366,11 @@
         return Promise.resolve();
     };
 
+    SerialTransport.prototype.has = function (ch) {
+        // serial frames carry no characteristic table; listening costs nothing
+        return ch !== CH.ANALOG_IN[1] && ch !== CH.ANALOG_IN[2];
+    };
+
     SerialTransport.prototype.disconnect = async function () {
         if (!this.open) {return; }
         this.open = false;
@@ -361,6 +393,173 @@
     };
 
     // ---------------------------------------------------------------------
+    // Remote transport (host page, e.g. Calliope Campus)
+    // The host forwards every access to the device it is connected to (over
+    // its own Bluetooth or USB link) and answers reads with empty bytes when
+    // there is none. Subscriptions are durable on the host side, it re-arms
+    // them after every reconnect, so they are sent once per characteristic.
+
+    var READ_TIMEOUT = 2000;
+
+    function remoteHostConfig() {
+        // answers {parentOrigin} when Snap! runs embedded in a host page
+        var params, origin, wrapper;
+        try {
+            params = new URLSearchParams(window.location.search);
+            origin = params.get('parentOrigin');
+            if (origin && window.parent !== window) {
+                return {parentOrigin: origin.trim()};
+            }
+        } catch (err) {/* ignore */}
+        try {
+            wrapper = window.SnapCalliopeHost;
+            if (wrapper && wrapper.parentOrigin && window.parent !== window) {
+                return {parentOrigin: wrapper.parentOrigin};
+            }
+        } catch (err) {/* ignore */}
+        return null;
+    }
+
+    function toBase64(bytes) {
+        var s = '', i;
+        for (i = 0; i < bytes.length; i += 1) {
+            s += String.fromCharCode(bytes[i]);
+        }
+        return btoa(s);
+    }
+
+    function fromBase64(b64) {
+        var raw, out, i;
+        if (!b64) {return new Uint8Array(0); }
+        raw = atob(b64);
+        out = new Uint8Array(raw.length);
+        for (i = 0; i < raw.length; i += 1) {out[i] = raw.charCodeAt(i); }
+        return out;
+    }
+
+    function RemoteTransport(config) {
+        this.origin = config.parentOrigin;
+        this.nextReqId = 1;
+        this.pendingReads = new Map(); // reqId -> resolve
+        this.listeners = {}; // characteristic uuid -> callback
+        this.subscribed = {}; // characteristic uuid -> true
+        this.queue = Promise.resolve();
+        this.onDisconnect = null;
+        this.streamsState = true; // the firmware notifies state & motion
+        this.active = true; // false while the host shows another editor
+        this.onHostMessage = null; // connection signals, see Calliope
+        window.addEventListener('message', event => this.receive(event));
+    }
+
+    RemoteTransport.prototype.post = function (message) {
+        try {
+            window.parent.postMessage(message, this.origin);
+        } catch (err) {
+            // the host went away; nothing to do
+        }
+    };
+
+    RemoteTransport.prototype.receive = function (event) {
+        var data = event.data, resolve, cb;
+        if (event.source !== window.parent || event.origin !== this.origin) {
+            return;
+        }
+        if (!data || typeof data !== 'object' ||
+                typeof data.type !== 'string' ||
+                data.type.indexOf('calliope.') !== 0) {
+            return;
+        }
+        if (data.type === 'calliope.readResult') {
+            resolve = this.pendingReads.get(data.reqId);
+            if (resolve) {
+                this.pendingReads.delete(data.reqId);
+                resolve(fromBase64(data.message));
+            }
+        } else if (data.type === 'calliope.notify') {
+            cb = this.listeners[String(data.characteristicId).toLowerCase()];
+            if (cb) {cb(fromBase64(data.message)); }
+        } else if (data.type === 'calliope.setActive') {
+            this.active = data.active !== false;
+            if (this.onHostMessage) {this.onHostMessage(data); }
+        } else if (this.onHostMessage) {
+            this.onHostMessage(data);
+        }
+    };
+
+    RemoteTransport.prototype.connect = function () {
+        return Promise.resolve(); // the host owns the connection
+    };
+
+    RemoteTransport.prototype.enqueue = BleTransport.prototype.enqueue;
+
+    RemoteTransport.prototype.read = function (ch) {
+        if (!this.active) {return Promise.resolve(new Uint8Array(0)); }
+        return this.enqueue(() => new Promise(resolve => {
+            var reqId = this.nextReqId;
+            this.nextReqId += 1;
+            this.pendingReads.set(reqId, resolve);
+            setTimeout(() => {
+                if (this.pendingReads.get(reqId) === resolve) {
+                    this.pendingReads.delete(reqId);
+                    resolve(new Uint8Array(0));
+                }
+            }, READ_TIMEOUT);
+            this.post({
+                type: 'calliope.read',
+                serviceId: SERVICE,
+                characteristicId: uuid(ch),
+                reqId: reqId
+            });
+        }));
+    };
+
+    RemoteTransport.prototype.write = function (ch, bytes, gap) {
+        if (!this.active) {return Promise.resolve(); }
+        return this.enqueue(async () => {
+            this.post({
+                type: 'calliope.write',
+                serviceId: SERVICE,
+                characteristicId: uuid(ch),
+                message: toBase64(bytes),
+                encoding: 'base64',
+                withResponse: false
+            });
+            await sleep(gap);
+        });
+    };
+
+    RemoteTransport.prototype.notify = function (ch, callback) {
+        var id = uuid(ch);
+        this.listeners[id] = callback;
+        if (!this.subscribed[id]) {
+            this.subscribed[id] = true;
+            this.post({
+                type: 'calliope.subscribe',
+                serviceId: SERVICE,
+                characteristicId: id
+            });
+        }
+        return Promise.resolve();
+    };
+
+    RemoteTransport.prototype.has = function (ch) {
+        return CONSOLIDATED.indexOf(ch) > -1;
+    };
+
+    RemoteTransport.prototype.disconnect = function () {
+        // the host keeps its link; answer pending reads so nothing hangs
+        this.pendingReads.forEach(resolve => resolve(new Uint8Array(0)));
+        this.pendingReads.clear();
+        return Promise.resolve();
+    };
+
+    RemoteTransport.prototype.reportStatus = function (status) {
+        // runtime version of the device's Blocks program, for the host's
+        // "outdated program" hint
+        this.post(Object.assign({type: 'snap.runtimeVersion'}, status));
+    };
+
+    // ---------------------------------------------------------------------
     // Calliope mini device
 
     function Calliope() {
@@ -368,12 +567,15 @@
         this.status = 'disconnected'; // 'connecting', 'connected', 'error'
         this.error = '';
         this.connectionEvents = {connected: 0, disconnected: 0};
+        this.remote = null; // RemoteTransport when a host owns the link
+        this.hostConnected = false; // the host's link, in remote mode
         this.reset();
     }
 
     Calliope.prototype.reset = function () {
         this.hardware = 0;
         this.route = 0;
+        this.runtimeVersion = 0;
         this.commandGap = 30;
         this.updateInterval = 50;
         this.digitalLevel = {};
@@ -395,6 +597,7 @@
         this.receivedData = {};
         this.config = {mic: false, pinMode: {}, touchRequested: {}};
         this.lastData = Date.now();
+        this.lastStateData = 0;
     };
 
     Calliope.prototype.isConnected = function () {
@@ -402,6 +605,18 @@
     };
 
     Calliope.prototype.connect = function (route) {
+        if (this.remote) {
+            // the host's connection widget owns the link
+            if (this.isConnected() || this.status === 'connecting') {return; }
+            if (this.hostConnected) {
+                this.remoteUp();
+            } else {
+                this.status = 'error';
+                this.error = 'Verbinde den Calliope mini oben ' +
+                    'über die Verbindungsanzeige.';
+            }
+            return;
+        }
         if (this.status === 'connecting') {return; }
         var useSerial = /usb|serial|kabel/i.test(String(route));
         this.disconnect(true);
@@ -426,17 +641,32 @@
         var t = this.transport, data;
         this.reset();
         data = await t.read(CH.COMMAND);
+        if (t !== this.transport) {return; } // disconnected meanwhile
+        if (!data || data.length < 3) {
+            // no answer: the device runs no Blocks program (yet)
+            throw new Error('Auf dem Calliope mini läuft kein ' +
+                'Blocks-Programm.');
+        }
         this.hardware = data[0];
         this.route = data[2];
+        this.runtimeVersion = data.length > 3 ? data[3] : 0;
         this.commandGap = this.route === ROUTE_SERIAL ? 100 : 30;
         this.updateInterval = this.hardware === HW_V1 ? 100 : 50;
+        if (t.reportStatus) {
+            t.reportStatus({
+                runtimeVersion: this.runtimeVersion,
+                hardware: this.hardware
+            });
+        }
         if (t.streamsState) {
             t.notify(CH.STATE, value => this.parseState(value));
             t.notify(CH.MOTION, value => this.parseMotion(value));
         }
-        await t.notify(CH.ACTION_EVENT, value => this.parseNotify(value));
+        if (t.has(CH.ACTION_EVENT)) {
+            await t.notify(CH.ACTION_EVENT, value => this.parseNotify(value));
+        }
         await t.notify(CH.PIN_EVENT, value => this.parseNotify(value));
-        if (this.hardware !== HW_V1) {
+        if (this.hardware !== HW_V1 && t.has(CH.MESSAGE)) {
             await t.notify(CH.MESSAGE, value => this.parseNotify(value));
         }
         if (t !== this.transport) {return; } // disconnected meanwhile
@@ -451,14 +681,20 @@
             loop = async () => {
                 while (this.transport === t && this.isConnected()) {
                     try {
-                        if (!t.streamsState) {
+                        // poll when the device does not stream, or when its
+                        // stream has paused (a notification got lost)
+                        if (!t.streamsState ||
+                                Date.now() - this.lastStateData > 250) {
                             this.parseState(await t.read(CH.STATE));
                             this.parseMotion(await t.read(CH.MOTION));
                         }
                     } catch (err) {
                         // ignore single failures, watchdog handles the rest
                     }
-                    if (Date.now() - this.lastData > DATA_TIMEOUT) {
+                    // a host tells when its link drops; empty answers while
+                    // it shows another editor are no lost connection
+                    if (!this.remote &&
+                            Date.now() - this.lastData > DATA_TIMEOUT) {
                         this.lost();
                         return;
                     }
@@ -480,6 +716,10 @@
     Calliope.prototype.disconnect = function (silent) {
         var t = this.transport,
             wasConnected = this.isConnected();
+        if (this.remote) {
+            // in a host page the link belongs to the host
+            return;
+        }
         this.transport = null;
         if (t) {
             t.onDisconnect = null;
@@ -488,6 +728,81 @@
         if (!silent || wasConnected) {
             this.status = 'disconnected';
         }
+        if (wasConnected) {
+            this.connectionEvents.disconnected = stamp();
+        }
+    };
+
+    // remote mode: mirror the host's connection --------------------------
+
+    Calliope.prototype.useRemote = function (config) {
+        this.remote = new RemoteTransport(config);
+        this.remote.onHostMessage = msg => this.hostMessage(msg);
+    };
+
+    Calliope.prototype.hostMessage = function (msg) {
+        switch (msg.type) {
+        case 'calliope.connection':
+            // the host's link came up or went down
+            this.hostConnected = !!msg.connected;
+            if (this.hostConnected) {
+                this.remoteUp();
+            } else {
+                this.remoteDown();
+            }
+            break;
+        case 'calliope.onConnect':
+        case 'calliope.rehandshake':
+            // the host (re)connected or flashed the device: read COMMAND
+            // again, which also re-reports the runtime version
+            this.hostConnected = true;
+            this.remoteUp(true);
+            break;
+        case 'calliope.setActive':
+            if (msg.active !== false && this.hostConnected) {
+                this.remoteUp(true);
+            }
+            break;
+        case 'calliope.disconnect':
+            this.hostConnected = false;
+            this.remoteDown();
+            break;
+        }
+    };
+
+    Calliope.prototype.remoteUp = function (again) {
+        if (this.status === 'connecting') {return; }
+        if (this.isConnected()) {
+            if (!again) {return; }
+            // keep the connection, just refresh what COMMAND tells
+            this.remote.read(CH.COMMAND).then(data => {
+                if (data && data.length > 3) {
+                    this.runtimeVersion = data[3];
+                    this.remote.reportStatus({
+                        runtimeVersion: this.runtimeVersion,
+                        hardware: data[0]
+                    });
+                }
+            });
+            return;
+        }
+        this.status = 'connecting';
+        this.error = '';
+        this.transport = this.remote;
+        this.handshake().catch(err => {
+            if (this.transport !== this.remote) {return; }
+            this.transport = null;
+            this.status = 'error';
+            this.error = String(err && err.message ? err.message : err);
+        });
+    };
+
+    Calliope.prototype.remoteDown = function () {
+        var wasConnected = this.isConnected();
+        this.transport = null;
+        if (this.remote) {this.remote.disconnect(); }
+        this.status = 'disconnected';
+        this.error = '';
         if (wasConnected) {
             this.connectionEvents.disconnected = stamp();
         }
@@ -510,6 +825,7 @@
         this.temperature = dv.getUint8(5) - 128;
         this.soundLevel = dv.getUint8(6);
         this.lastData = Date.now();
+        this.lastStateData = this.lastData;
     };
 
     Calliope.prototype.parseMotion = function (data) {
@@ -686,8 +1002,15 @@
 
     Calliope.prototype.analog = function (pin) {
         // answers the value 0..1023 or -1 while a request is pending
-        var ch = CH.ANALOG_IN[pin], t = this.transport;
-        if (!this.isConnected() || ch === undefined) {return 0; }
+        var t = this.transport,
+            // older firmware: one characteristic per pin; consolidated:
+            // all pins packed into the first one
+            perPin = t && t.has(CH.ANALOG_IN[1]),
+            ch = perPin ? CH.ANALOG_IN[pin] : CH.ANALOG_IN[0],
+            offset = perPin ? 0 : pin * 2;
+        if (!this.isConnected() || CH.ANALOG_IN[pin] === undefined) {
+            return 0;
+        }
         if (Date.now() - (this.analogUpdated[pin] || 0) < 100) {
             return this.analogValue[pin];
         }
@@ -698,7 +1021,8 @@
         this.analogPending[pin] = true;
         t.read(ch).then(data => {
             var dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-            this.analogValue[pin] = dv.getUint16(0, true);
+            this.analogValue[pin] = data.length >= offset + 2 ?
+                    dv.getUint16(offset, true) : 0;
         }).catch(() => {
             this.analogValue[pin] = this.analogValue[pin] || 0;
         }).finally(() => {
@@ -841,7 +1165,11 @@
     var cal = new Calliope(),
         prims = SnapExtensions.primitives;
 
-    window.SnapCalliope = cal; // for debugging
+    window.SnapCalliope = cal; // for debugging and the host bridge
+
+    if (remoteHostConfig()) {
+        cal.useRemote(remoteHostConfig());
+    }
 
     // connection
 

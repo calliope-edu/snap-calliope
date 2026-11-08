@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /*
-    Generates ../calliope_module.xml (Snap! library "Calliope mini")
-    from the block table below.
+    Generates from the block table below
+      - calliope_module.xml, the Snap! library "Calliope mini"
+      - template.xml, an empty project with the library already loaded
+        (the start project of a new Snap! program in Calliope Campus)
 
-        node snap-libraries/calliope/build-library.js
+        node calliope/build-library.js      (or: npm run library)
 
     Every custom block first runs src_load(libraries/calliope/calliope.js)
     (a no-op after the first call) and then calls the cal_* primitives
@@ -324,40 +326,53 @@ function definitionXML(b) {
         '</block-definition>';
 }
 
-const xml = '<blocks app="Snap! 12, https://snap.berkeley.edu" version="2">' +
-    `<palette><category name="${esc(CATEGORY)}" color="${COLOR}"/></palette>` +
-    blocks.map(definitionXML).join('') +
-    '</blocks>';
+const palette =
+    `<palette><category name="${esc(CATEGORY)}" color="${COLOR}"/></palette>`;
+const definitions = blocks.map(definitionXML).join('');
 
-const target = path.join(__dirname, '..', 'calliope_module.xml');
-fs.writeFileSync(target, xml);
+const library = '<blocks app="Snap! 12, https://snap.berkeley.edu" version="2">' +
+    palette + definitions + '</blocks>';
+
+const target = path.join(__dirname, 'calliope_module.xml');
+fs.writeFileSync(target, library);
 console.log(`wrote ${blocks.length} blocks to ${target}`);
 
-// --- Snap!Schule editor template with the library preloaded --------------
-// static/template.xml + palette category + global block definitions
-// => static/template-calliope.xml
+// --- start project with the library preloaded ------------------------------
+// An empty project (German names, one sprite) whose scene carries the
+// "Calliope mini" category and all its blocks as global custom blocks.
 
-const base = path.join(__dirname, '..', '..', 'static', 'template.xml');
-if (fs.existsSync(base)) {
-    let project = fs.readFileSync(base, 'utf8');
-    const palette =
-        `<palette><category name="${esc(CATEGORY)}" color="${COLOR}"/></palette>`;
-    const definitions = blocks.map(definitionXML).join('');
-    // custom category: <palette> right after the scene's <notes>
-    project = project.replace(
-        /(<scene [^>]*>)(<notes>[^<]*<\/notes>)/,
-        `$1$2${palette}`
-    );
-    // global custom blocks: the scene's <blocks> after <headers>/<code>
-    project = project.replace(
-        /(<headers><\/headers><code><\/code>)<blocks><\/blocks>/,
-        `$1<blocks>${definitions}</blocks>`
-    );
-    if (!project.includes(palette) || !project.includes(definitions)) {
-        throw new Error('static/template.xml has an unexpected structure');
-    }
-    const out = path.join(__dirname, '..', '..', 'static',
-        'template-calliope.xml');
-    fs.writeFileSync(out, project);
-    console.log(`wrote Snap!Schule template ${out}`);
-}
+const PROJECT = 'Calliope mini';
+const project =
+    `<project name="${esc(PROJECT)}" app="Snap! 12, https://snap.berkeley.edu" version="2">` +
+    '<notes></notes>' +
+    '<scenes select="1">' +
+    `<scene name="${esc(PROJECT)}">` +
+    '<notes></notes>' + palette + '<hidden></hidden>' +
+    '<headers></headers><code></code>' +
+    `<blocks>${definitions}</blocks>` +
+    '<primitives></primitives>' +
+    '<stage name="Bühne" width="480" height="360" costume="0" ' +
+    'color="255,255,255,1" tempo="60" threadsafe="false" penlog="false" ' +
+    'volume="100" pan="0" lines="round" ternary="false" hyperops="true" ' +
+    'codify="false" inheritance="true" sublistIDs="false">' +
+    '<costumes><list struct="atomic"></list></costumes>' +
+    '<sounds><list struct="atomic"></list></sounds>' +
+    '<variables></variables><blocks></blocks><scripts></scripts>' +
+    '<sprites select="1">' +
+    '<sprite name="Objekt" idx="1" x="0" y="0" heading="90" scale="1" ' +
+    'volume="100" pan="0" rotation="1" draggable="true" costume="0" ' +
+    'color="80,80,80,1" pen="tip">' +
+    '<costumes><list struct="atomic"></list></costumes>' +
+    '<sounds><list struct="atomic"></list></sounds>' +
+    '<blocks></blocks><variables></variables><scripts></scripts>' +
+    '</sprite>' +
+    '</sprites>' +
+    '</stage>' +
+    '<variables></variables>' +
+    '</scene>' +
+    '</scenes>' +
+    '</project>';
+
+const templateTarget = path.join(__dirname, 'template.xml');
+fs.writeFileSync(templateTarget, project);
+console.log(`wrote start project ${templateTarget}`);
