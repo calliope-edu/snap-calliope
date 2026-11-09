@@ -6,12 +6,15 @@ Snap! itself is a fixed release of [jmoenig/Snap](https://github.com/jmoenig/Sna
 included unchanged; this repository adds the Calliope mini blocks and the pages
 Campus embeds.
 
-The Calliope mini part comes from
+The Calliope mini blocks are the ones of the Calliope Blocks editor, with the
+same German labels, and reach the device the way it does: Snap! has no
+Bluetooth or USB code of its own. Campus connects the Calliope mini with its
+connection widget and forwards Snap!'s device access to it (see below). Opened
+on its own, outside Campus, Snap! reaches no device.
+
+The library started from the one in
 [snap-schule](https://github.com/sparks4school-Foundation/snap-schule)
-(`snap-libraries/calliope/`, by Jörn Alraun). `calliope/calliope.js` is the same
-file with a third way to reach the device: through the host page (see below).
-Without a host it still connects over Bluetooth or USB itself, so snap.schule can
-take it back unchanged.
+(`snap-libraries/calliope/`, by Jörn Alraun).
 
 ## Build
 
@@ -61,13 +64,29 @@ that origin count.
 | | `snap.save {key, xml}` | the user saved (Ctrl+S, file menu) |
 | | `snap.runtimeVersion {runtimeVersion, hardware}` | what the device's Blocks program reported |
 
-Device access uses the messages Campus already speaks with the Blocks editor
-(`calliopeRemoteHost.ts` there): Snap! sends `calliope.read`, `calliope.write`,
-`calliope.subscribe`, Campus answers with `calliope.readResult` and
-`calliope.notify` and signals its connection with `calliope.connection
-{connected}`, `calliope.onConnect`, `calliope.rehandshake` and
-`calliope.setActive`. In Campus the blocks "verbinde"/"trenne" open no device
-dialog; the connection is the one of Campus' connection widget.
+Device access is the Blocks editor's (its `CalliopeRemote` in scratch-vm, and
+`calliopeRemoteHost.ts` in Campus): `calliope/calliope.js` is a puppet of the
+host, which owns the connection.
+
+| Direction | Message | Meaning |
+|---|---|---|
+| Snap! → Campus | `calliope.read {serviceId, characteristicId, reqId}` | read a characteristic |
+| | `calliope.write {serviceId, characteristicId, message, encoding, withResponse}` | write one (base64) |
+| | `calliope.subscribe {serviceId, characteristicId}` | notifications; the host keeps them across reconnects |
+| Campus → Snap! | `calliope.readResult {reqId, message}` | the bytes; empty without a device |
+| | `calliope.notify {characteristicId, message}` | a notification |
+| | `calliope.setActive {active}` | `false`: no device access while another editor shows |
+| | `calliope.rehandshake` | read COMMAND again and report the runtime version (after a reconnect or flash) |
+| | `calliope.onConnect` | a Blocks program got connected: show "C" on the mini, fire "Wenn Calliope mini verbunden ist" |
+| | `calliope.rearmInputs` | arm touch pads and pin events anew |
+| | `calliope.disconnect` | forget what the device reported |
+
+The device protocol is the Blocks firmware's, as the Blocks editor's
+`calliopeMini` extension speaks it: COMMAND (0x0100) for commands and the
+handshake (hardware, protocol, route, runtime version, armed touch pads and pin
+events), STATE (0x0101) and MOTION (0x0102) for the sensors (notified from
+runtime version 2 on, polled before), SENSOR_EVENT (0x0110) for button, gesture
+and pin events, ANALOG_IN (0x0120) for P0..P3.
 
 Read only: Snap! knows no such mode. The page locks dragging, editing inputs,
 context menus and typing blocks, hides the palette and reports nothing; scripts
@@ -94,7 +113,7 @@ The Calliope mini needs the Blocks program (the same as for the Blocks editor).
 
 `npm run dev`, then <http://localhost:8610/dev/host.html>: a test host that
 embeds `campus.html` like Campus does, logs the messages and plays a Calliope
-mini (connect, button A).
+mini (connect, button A; it shows the display and the RGB LEDs).
 
 ## License
 

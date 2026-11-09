@@ -11,9 +11,12 @@ README explains the layout, the build and the message protocol.
   `bridge/`) and uses Snap!'s JavaScript API (`src/api.js`) or wraps its
   prototypes at runtime. A Snap! update is a change of `snapVersion` plus a check
   that the pages still work; Snap! releases come out almost weekly.
-- `calliope/calliope.js` stays usable without a host (Bluetooth/USB) so
-  snap.schule (`sparks4school-Foundation/snap-schule`, `snap-libraries/calliope/`)
-  can take it over. Remote mode only switches on with a parent origin.
+- `calliope/calliope.js` has no device code of its own: like the Blocks
+  editor's `CalliopeRemote` (scratch-vm `src/io/calliopeRemote.js`) it sends
+  every device access to Campus, whose connection widget owns the link. No
+  Bluetooth or USB here, no connect/disconnect blocks; outside Campus the blocks
+  reach no device. The blocks follow the Blocks editor's `calliopeMini`
+  extension (block set, German labels, firmware protocol).
 - `calliope/calliope_module.xml` and `calliope/template.xml` are generated: edit
   the block table in `calliope/build-library.js` and run `npm run library`.
 - The device protocol must match Campus' `src/lib/blocks/calliopeRemoteHost.ts`

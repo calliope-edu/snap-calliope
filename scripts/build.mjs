@@ -101,16 +101,16 @@ function registerLibrary() {
 		fileName: 'calliope_module.xml',
 		name: 'Calliope mini',
 		description:
-			'Control a Calliope mini via Bluetooth or USB. Needs the Blocks ' +
-			'program on the Calliope mini and Chrome, Edge or a Chromebook.',
+			'Control a Calliope mini in Calliope Campus, connected there over ' +
+			'Bluetooth or USB. Needs the Blocks program on the Calliope mini.',
 		categories: ['Calliope mini'],
 		translations: {
 			de: {
 				name: 'Calliope mini',
 				description:
-					'Steuere einen Calliope mini über Bluetooth oder USB. Auf dem ' +
-					'Calliope mini muss das Blocks-Programm laufen; benötigt ' +
-					'Chrome, Edge oder ein Chromebook.'
+					'Steuere einen Calliope mini in Calliope Campus, dort über ' +
+					'Bluetooth oder USB verbunden. Auf dem Calliope mini muss das ' +
+					'Blocks-Programm laufen.'
 			}
 		}
 	});

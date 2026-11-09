@@ -7,23 +7,15 @@
             scripts below are the ones of the bundled release's snap.html.
             Unlike snap.html this page registers no service worker and loads
             no tracking. Embedded with ?parentOrigin=..., it talks to its host
-            (bridge/campus.js); opened on its own it is plain Snap! with the
-            library, connecting over Bluetooth or USB itself.
+            (bridge/campus.js) and reaches the Calliope mini through it
+            (calliope.js); opened on its own it is plain Snap! with the
+            library, whose blocks then reach no device.
         -->
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Snap! – Calliope mini</title>
         <base href="snap/">
         <link rel="icon" href="src/favicon.ico" type="image/x-icon">
-        <script>
-            // read by calliope.js: route all device access through the host
-            (function () {
-                var origin = new URLSearchParams(location.search).get('parentOrigin');
-                if (origin && window.parent !== window) {
-                    window.SnapCalliopeHost = {parentOrigin: origin};
-                }
-            }());
-        </script>
 <!-- SNAP_SCRIPTS -->
         <script src="libraries/calliope/calliope.js"></script>
         <script src="../bridge/campus.js"></script>

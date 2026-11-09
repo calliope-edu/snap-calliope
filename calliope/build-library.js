@@ -41,11 +41,8 @@ const run = (prim, args = []) =>
 const call = (prim, args = []) =>
     `<block s="reportApplyExtension">${l(prim)}${list(args)}</block>`;
 const report = expr => `<block s="doReport">${expr}</block>`;
-const eq = (a, b) => `<block s="reportVariadicEquals">${list([a, b])}</block>`;
 const not = a => `<block s="reportNot">${a}</block>`;
 const lt = (a, b) => `<block s="reportVariadicLessThan">${list([a, b])}</block>`;
-const ifThen = (cond, body) =>
-    `<block s="doIf">${cond}<script>${body.join('')}</script><list></list></block>`;
 
 // input slot declarations
 const menu = (options, def = options[0], type = '%s') => ({
@@ -57,59 +54,35 @@ const field = (def = '', type = '%s', options = null) => ({
 
 const PINS_GPIO = ['P0', 'P1', 'P2', 'P3', 'C8', 'C9', 'C12', 'C13',
     'C14', 'C15', 'C16', 'C17'];
-const BUTTONS = ['A', 'B', 'A+B'];
-const BUTTON_EVENTS = ['geklickt', 'unten', 'oben', 'lange geklickt',
-    'gehalten', 'doppelt geklickt'];
+const PINS_ANALOG = ['P0', 'P1', 'P2', 'P3'];
+const BUTTONS = ['A', 'B'];
+const BUTTON_EVENTS = ['geklickt', 'unten', 'oben'];
 const TOUCH = ['Logo', 'P0', 'P1', 'P2', 'P3'];
-const TOUCH_EVENTS = ['berührt', 'losgelassen', 'getippt', 'lange getippt',
-    'gehalten', 'doppelt getippt'];
+const TOUCH_EVENTS = ['berührt', 'losgelassen', 'getippt'];
 const GESTURES = ['geschüttelt', 'Logo nach oben', 'Logo nach unten',
     'nach links gedreht', 'nach rechts gedreht', 'Display nach oben',
     'Display nach unten', 'freier Fall', '3g beschleunigt',
     '6g beschleunigt', '8g beschleunigt'];
 const COLORS = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff',
     '#00ffff', '#ffffff', '#000000'];
-const PIN_EVENTS = ['Ansteigen', 'Abfallen', 'Impuls hoch', 'Impuls tief'];
+const AXES = ['x', 'y', 'z', 'Betrag'];
+const PIN_EVENTS = ['Impuls tief', 'Impuls hoch', 'Abfallen', 'Ansteigen'];
 
 // --- blocks ---------------------------------------------------------------
-// spec: English spec with %'param' names, de: German translation (_ = input)
+// The blocks of the Blocks editor's Calliope mini extension, with its German
+// labels. spec: English spec with %'param' names, de: German translation
+// (_ = input).
+
+const sensor = (spec, de, prim, space = false) =>
+    ({spec, de, type: 'reporter', body: [report(call(prim))], space});
 
 const blocks = [
-    // connection
+    // connection: Campus connects; this fires once the device is there
     {
-        spec: "connect Calliope mini via %'route'",
-        de: 'verbinde Calliope mini über _',
-        type: 'command',
-        inputs: [menu(['Bluetooth', 'USB'])],
-        body: [
-            run('cal_connect(route)', [v('route')]),
-            `<block s="doWaitUntil">${not(eq(call('cal_status()'),
-                l('connecting')))}</block>`,
-            ifThen(
-                eq(call('cal_status()'), l('error')),
-                [run('err_error(msg)', [call('cal_error()')])]
-            )
-        ]
-    },
-    {
-        spec: 'disconnect Calliope mini',
-        de: 'trenne Calliope mini',
-        type: 'command',
-        body: [run('cal_disconnect()')]
-    },
-    {
-        spec: 'Calliope mini connected?',
-        de: 'Calliope mini verbunden?',
-        type: 'predicate',
-        body: [report(call('cal_connected()'))]
-    },
-    {
-        spec: "when Calliope mini %'state'",
-        de: 'Wenn Calliope mini _ ist',
+        spec: 'when Calliope mini connected',
+        de: 'Wenn Calliope mini verbunden ist',
         type: 'hat',
-        inputs: [menu(['verbunden', 'getrennt'])],
-        body: [report(call('cal_connection_event(state)', [v('state')]))],
-        space: true
+        body: [report(call('cal_when_connected()'))]
     },
 
     // buttons, touch, gestures
@@ -124,7 +97,7 @@ const blocks = [
     },
     {
         spec: "button %'button' pressed?",
-        de: 'Taste _ gedrückt?',
+        de: 'Taste _ wird gedrückt?',
         type: 'predicate',
         inputs: [menu(BUTTONS)],
         body: [report(call('cal_button_pressed(name)', [v('button')]))]
@@ -134,19 +107,26 @@ const blocks = [
         de: 'Wenn Pin _ _ wird',
         type: 'hat',
         inputs: [menu(TOUCH), menu(TOUCH_EVENTS)],
-        body: [report(call('cal_button_event(name, event)',
+        body: [report(call('cal_touch_event(pin, event)',
             [v('pin'), v('event')]))]
     },
     {
         spec: "pin %'pin' touched?",
-        de: 'Pin _ berührt?',
+        de: 'Pin _ wird berührt?',
         type: 'predicate',
         inputs: [menu(TOUCH)],
-        body: [report(call('cal_button_pressed(name)', [v('pin')]))]
+        body: [report(call('cal_touched(pin)', [v('pin')]))]
     },
     {
-        spec: "when gesture %'gesture'",
-        de: 'Wenn Bewegung _',
+        spec: "set all pins to touch mode %'type'",
+        de: 'setze alle Pins auf Berührungsmodus _',
+        type: 'command',
+        inputs: [menu(['Kapazitiv', 'Resistiv'])],
+        body: [run('cal_touch_type(type)', [v('type')])]
+    },
+    {
+        spec: "when %'gesture'",
+        de: 'Wenn _',
         type: 'hat',
         inputs: [menu(GESTURES)],
         body: [report(call('cal_gesture(name)', [v('gesture')]))]
@@ -201,9 +181,7 @@ const blocks = [
         de: 'Motor _ an mit _ %',
         type: 'command',
         inputs: [menu(['M0', 'M1', 'M0 & M1']), field('100', '%n')],
-        body: [ifThen(eq(v('motor'), l('M0 & M1')),
-            [`<block s="doSetVar">${l('motor')}${l('m0m1')}</block>`]),
-            run('cal_motor(motor, speed)', [v('motor'), v('speed')])]
+        body: [run('cal_motor(motor, speed)', [v('motor'), v('speed')])]
     },
 
     // sound
@@ -224,35 +202,31 @@ const blocks = [
     },
 
     // sensors
-    {
-        spec: "Calliope %'sensor'",
-        de: 'Calliope _',
-        type: 'reporter',
-        inputs: [menu(['Lichtstärke', 'Temperatur', 'Kompassrichtung',
-            'Neigung vor/zurück', 'Neigung links/rechts', 'Lautstärke',
-            'Magnetkraft'])],
-        body: [report(call('cal_sensor(name)', [v('sensor')]))],
-        space: true
-    },
+    sensor('light intensity', 'Lichtstärke', 'cal_light()', true),
+    sensor('temperature °C', 'Temperatur °C', 'cal_temperature()'),
+    sensor('compass heading °', 'Kompassrichtung °', 'cal_compass()'),
+    sensor('pitch', 'Pitch', 'cal_pitch()'),
+    sensor('roll', 'Roll', 'cal_roll()'),
+    sensor('sound level', 'Lautstärke', 'cal_sound()'),
     {
         spec: "acceleration %'axis' mg",
         de: 'Beschleunigung _ mg',
         type: 'reporter',
-        inputs: [menu(['x', 'y', 'z', 'Betrag'])],
+        inputs: [menu(AXES)],
         body: [report(call('cal_acceleration(axis)', [v('axis')]))]
     },
     {
         spec: "magnetic force %'axis' µT",
         de: 'Magnetkraft _ µT',
         type: 'reporter',
-        inputs: [menu(['Betrag', 'x', 'y', 'z'])],
+        inputs: [menu(AXES, 'Betrag')],
         body: [report(call('cal_magnetic(axis)', [v('axis')]))]
     },
     {
         spec: "analog value of pin %'pin'",
         de: 'analoger Wert von Pin _',
         type: 'reporter',
-        inputs: [menu(['P0', 'P1', 'P2'])],
+        inputs: [menu(PINS_ANALOG)],
         body: [
             `<block s="doDeclareVariables">${list([l('value')])}</block>`,
             `<block s="doSetVar">${l('value')}${call('cal_analog(pin)',
@@ -266,19 +240,19 @@ const blocks = [
 
     // pins
     {
+        spec: "set pin %'pin' to input %'mode'",
+        de: 'setze Eingang _ auf _',
+        type: 'command',
+        inputs: [menu(PINS_GPIO), menu(['Pullup', 'Pulldown', 'nichts'])],
+        body: [run('cal_pull(pin, mode)', [v('pin'), v('mode')])],
+        space: true
+    },
+    {
         spec: "pin %'pin' is high?",
         de: 'ist Pin _ hoch?',
         type: 'predicate',
         inputs: [menu(PINS_GPIO)],
-        body: [report(call('cal_pin_high(pin)', [v('pin')]))],
-        space: true
-    },
-    {
-        spec: "set pin %'pin' to input %'mode'",
-        de: 'setze Eingang _ auf _',
-        type: 'command',
-        inputs: [menu(PINS_GPIO), menu(['nichts', 'Pullup', 'Pulldown'])],
-        body: [run('cal_pull(pin, mode)', [v('pin'), v('mode')])]
+        body: [report(call('cal_pin_high(pin)', [v('pin')]))]
     },
     {
         spec: "set digital pin %'pin' to %'level'",
@@ -300,10 +274,31 @@ const blocks = [
         type: 'command',
         inputs: [menu(PINS_GPIO), field('90', '%n')],
         body: [run('cal_servo(pin, angle)', [v('pin'), v('angle')])]
+    },
+    {
+        spec: "listen for %'type' at pin %'pin'",
+        de: 'warte auf _ an Pin _',
+        type: 'command',
+        inputs: [menu(['Impuls', 'Flanke', 'nichts']), menu(PINS_GPIO)],
+        body: [run('cal_listen_pin(pin, type)', [v('pin'), v('type')])],
+        space: true
+    },
+    {
+        spec: "when %'event' at pin %'pin'",
+        de: 'Wenn ein _ an Pin _ erkannt wird',
+        type: 'hat',
+        inputs: [menu(PIN_EVENTS), menu(PINS_GPIO)],
+        body: [report(call('cal_pin_event(pin, event)',
+            [v('pin'), v('event')]))]
+    },
+    {
+        spec: "value of %'event' at pin %'pin'",
+        de: 'Wert von _ an Pin _',
+        type: 'reporter',
+        inputs: [menu(PIN_EVENTS), menu(PINS_GPIO)],
+        body: [report(call('cal_pin_event_value(pin, event)',
+            [v('pin'), v('event')]))]
     }
-    // pin event blocks (listen / when / value) are hidden on purpose;
-    // the primitives cal_listen_pin, cal_pin_event, cal_pin_event_value
-    // still exist in calliope.js
 ];
 
 // --- XML ------------------------------------------------------------------

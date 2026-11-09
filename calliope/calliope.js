@@ -1,126 +1,96 @@
 /*
     calliope.js
 
-    Snap! extension for the Calliope mini 3.
-    Talks to the Calliope mini Blocks firmware (https://calliope.cc/programmieren/editoren/calliope-mini-blocks-scratch-programmieren) via
-      - Web Bluetooth (GATT service 0b50f3e4-...)
-      - Web Serial (USB, framed protocol of the same firmware)
-      - a host page (RemoteTransport), when Snap! runs embedded in
-        Calliope Campus: every GATT access goes to the parent window as
-        calliope.read/write/subscribe/unsubscribe postMessages, in the
-        format Campus already speaks with the Blocks editor
-        (src/lib/blocks/calliopeRemoteHost.ts). The host owns the
-        connection; the blocks "connect"/"disconnect" only mirror it.
+    The Calliope mini library of Snap! for Calliope Campus.
 
-    The remote mode is on when a parent origin is known: either the page's
-    own URL has ?parentOrigin=..., or a same-origin wrapper page (campus.html
-    of snap-calliope) sets window.SnapCalliopeHost = {parentOrigin}. Without
-    one, Bluetooth and USB work as before, so snap.schule can use this very
-    file unchanged.
+    Snap! has no device code of its own. Like the Blocks editor (its
+    CalliopeRemote, scratch-vm src/io/calliopeRemote.js) it is a puppet of
+    its host page: every access to the Calliope mini goes to the parent
+    window as a postMessage, and Campus forwards it to whatever the
+    connection widget is connected to, over Bluetooth or USB
+    (src/lib/blocks/calliopeRemoteHost.ts in calliope-campus). Campus owns
+    the connection; there is no connect or disconnect block.
 
-    Protocol and logic follow the Calliope mini extension of
-    https://github.com/calliope-edu/Scratch-more-v3 (scratch-vm/src/extensions/calliopeMini)
-    and its successor in https://github.com/calliope-edu/blocks: the
-    consolidated firmware protocol carries pin, button, gesture and data
-    events on one characteristic (0x0110) and all analog pins packed into
-    one read (0x0120); the older per-event characteristics are still used
-    when a device offers them.
+    The host is the parent window on the origin given by ?parentOrigin=...
+    in the page's URL ("*" for any). Without one (Snap! opened on its own)
+    the blocks do nothing.
 
-    Requires a Chromium based browser (Chrome, Edge, Chromebook).
+    Snap! -> host
+        {type: 'calliope.read', serviceId, characteristicId, reqId}
+        {type: 'calliope.write', serviceId, characteristicId, message,
+            encoding: 'base64', withResponse}
+        {type: 'calliope.subscribe', serviceId, characteristicId}
+        {type: 'snap.runtimeVersion', runtimeVersion, hardware}
+    host -> Snap!
+        {type: 'calliope.readResult', reqId, message}    empty: no device
+        {type: 'calliope.notify', characteristicId, message}
+        {type: 'calliope.setActive', active}  false: no device access
+        {type: 'calliope.rehandshake'}        read COMMAND, report version
+        {type: 'calliope.onConnect'}          show "C", fire "when connected"
+        {type: 'calliope.rearmInputs'}        arm touch pads and pins anew
+        {type: 'calliope.disconnect'}         forget the device's state
 
-    All primitives are registered in SnapExtensions with the prefix "cal_".
-    The custom blocks in calliope_module.xml call them.
+    The device runs the Blocks program (the firmware of the Blocks editor).
+    Its protocol, as the Blocks editor's calliopeMini extension speaks it:
+    service 0b50f3e4-..., characteristics COMMAND 0x0100 (commands,
+    handshake), STATE 0x0101 and MOTION 0x0102 (sensors; notified from
+    runtime version 2 on, polled before), SENSOR_EVENT 0x0110 (button,
+    gesture and pin events, kind in byte 19), ANALOG_IN 0x0120 (P0..P3).
+
+    All primitives are registered in SnapExtensions with the prefix "cal_";
+    the custom blocks in calliope_module.xml call them.
 */
 
-/*global SnapExtensions, List, Color, Process*/
+/*global SnapExtensions, List, Color, IDE_Morph*/
 
 (function () {
     'use strict';
 
-    if (SnapExtensions.primitives.has('cal_status()')) {
+    if (SnapExtensions.primitives.has('cal_when_connected()')) {
         return; // already loaded
     }
 
     // ---------------------------------------------------------------------
-    // constants (see MbitMoreCommon.h / scratch-vm calliopeMini/index.js)
+    // protocol
 
     var SERVICE = '0b50f3e4-607f-4151-9091-7d008d6ffc5c',
-        CH = {
-            COMMAND: 0x0100,
-            STATE: 0x0101,
-            MOTION: 0x0102,
-            // consolidated firmware: pin, action and data events on 0x0110
-            PIN_EVENT: 0x0110,
-            // older firmware only: separate action and message events
-            ACTION_EVENT: 0x0111,
-            MESSAGE: 0x0130,
-            // consolidated firmware: P0..P3 as uint16 LE at offsets 0/2/4/6
-            // of 0x0120; older firmware: one characteristic per pin
-            ANALOG_IN: [0x0120, 0x0121, 0x0122]
-        },
-        // what the consolidated firmware (and so the Campus host) offers
-        CONSOLIDATED = [0x0100, 0x0101, 0x0102, 0x0110, 0x0120],
-        CMD = {
-            CONFIG: 0x00,
-            PIN: 0x01,
-            DISPLAY: 0x02,
-            AUDIO: 0x03,
-            DATA: 0x04,
-            RGB: 0x05,
-            MOTOR: 0x06
-        },
-        PIN_CMD = {
-            SET_OUTPUT: 0x01,
-            SET_PWM: 0x02,
-            SET_SERVO: 0x03,
-            SET_PULL: 0x04,
-            SET_EVENT: 0x05
-        },
-        DISPLAY_CMD = {
-            CLEAR: 0x00,
-            TEXT: 0x01,
-            PIXELS_0: 0x02,
-            PIXELS_1: 0x03
-        },
-        CONFIG_CMD = {MIC: 0x01, TOUCH: 0x02},
-        AUDIO_CMD = {STOP_TONE: 0x00, PLAY_TONE: 0x01},
-        MOTOR_CMD = {M0: 0x01, M1: 0x02, M0_M1: 0x03},
-        DATA_FORMAT = {PIN_EVENT: 0x11, ACTION_EVENT: 0x12,
-            DATA_NUMBER: 0x13, DATA_TEXT: 0x14},
-        ACTION_EVENT = {BUTTON: 0x01, GESTURE: 0x02},
-        PULL = {NONE: 0, DOWN: 1, UP: 2},
-        PIN_EVENT_TYPE = {NONE: 0, ON_EDGE: 1, ON_PULSE: 2, ON_TOUCH: 3},
-        PIN_EVENT = {RISE: 2, FALL: 3, PULSE_HIGH: 4, PULSE_LOW: 5},
-        HW_V1 = 1,
-        ROUTE_SERIAL = 1,
+        CH = {COMMAND: 0x0100, STATE: 0x0101, MOTION: 0x0102,
+            SENSOR_EVENT: 0x0110, ANALOG_IN: 0x0120},
+        CMD = {CONFIG: 0, PIN: 1, DISPLAY: 2, AUDIO: 3, RGB: 5, MOTOR: 6},
+        CONFIG = {MIC: 1, TOUCH: 2},
+        PIN = {OUTPUT: 1, PWM: 2, SERVO: 3, PULL: 4, EVENT: 5},
+        DISPLAY = {TEXT: 1, PIXELS_0: 2, PIXELS_1: 3, PIXELS_PACKED: 4},
+        AUDIO = {STOP: 0, PLAY: 1},
+        MOTOR = {m0: 1, m1: 2, m0m1: 3},
+        EVENT_KIND = {PIN: 0x11, ACTION: 0x12},
+        ACTION = {BUTTON: 1, GESTURE: 2},
+        ROUTE = {BLE: 0, SERIAL: 1, DAP: 2},
+        HW_DAL = 1, // mini 1 and 2; 2 is CODAL (mini 3)
+        V2_FEATURES = 2, // runtime version with notified sensors, packed
+                         // pixels and the display generation byte
         BUTTON_ID = {1: 'A', 2: 'B', 100: 'P0', 101: 'P1', 102: 'P2',
             103: 'P3', 121: 'LOGO'},
-        BUTTON_STATE_INDEX = {P0: 0, P1: 1, P2: 2, P3: 3, A: 4, B: 5, LOGO: 6},
-        BUTTON_PIN_INDEX = {P0: 0, P1: 1, P2: 2, P3: 3},
-        BUTTON_EVENT_ID = {1: 'DOWN', 2: 'UP', 3: 'CLICK', 4: 'LONG_CLICK',
-            5: 'HOLD', 6: 'DOUBLE_CLICK'},
+        BUTTON_EVENT_ID = {1: 'DOWN', 2: 'UP', 3: 'CLICK'},
+        STATE_BIT = {P0: 24, P1: 25, P2: 26, P3: 27, A: 28, B: 29, LOGO: 30},
+        TOUCH_PIN = {P0: 0, P1: 1, P2: 2, P3: 3},
         GESTURE_ID = {1: 'TILT_UP', 2: 'TILT_DOWN', 3: 'TILT_LEFT',
             4: 'TILT_RIGHT', 5: 'FACE_UP', 6: 'FACE_DOWN', 7: 'FREEFALL',
             8: 'G3', 9: 'G6', 10: 'G8', 11: 'SHAKE'},
         GPIO = [0, 1, 2, 3, 8, 9, 12, 13, 14, 15, 16, 17],
-        G = 1024,
-        DATA_TIMEOUT = 4500, // ms without data => connection lost
-        USB_FILTER = {usbVendorId: 0x0d28, usbProductId: 0x0204},
-        SERIAL_SFD = 0xFF,
-        SERIAL_REQ = {READ: 0x01, WRITE: 0x10, WRITE_RESPONSE: 0x11},
-        SERIAL_RES = {READ: 0x01, WRITE_RESPONSE: 0x11, NOTIFY: 0x21};
+        PULL = {NONE: 0, DOWN: 1, UP: 2},
+        PIN_EVENT_TYPE = {NONE: 0, ON_EDGE: 1, ON_PULSE: 2},
+        PIN_EVENT = {RISE: 2, FALL: 3, PULSE_HIGH: 4, PULSE_LOW: 5},
+        READ_TIMEOUT = 2000, // ms until a read counts as unanswered
+        HANDSHAKE_DELAY = 500, // ms after start before the first COMMAND read
+        RECHECK_TICKS = 20, // updater ticks between COMMAND reads
+        STATE_STALE = 200, // ms without a STATE notification => poll
+        ARM_RETRY = 1000, // ms between attempts to arm a touch pad or pin
+        PIN_EVENT_GRACE = 500, // ms before a pin event counts as unarmed
+        CONNECT_HAT_DELAY = 500; // ms the "C" shows before "when connected"
 
     function uuid(ch) {
         return '0b50' + ch.toString(16).padStart(4, '0') +
             '-607f-4151-9091-7d008d6ffc5c';
-    }
-
-    var lastStamp = 0;
-
-    function stamp() {
-        // strictly increasing timestamps, so equal events never collide
-        lastStamp = Math.max(Date.now(), lastStamp + 1);
-        return lastStamp;
     }
 
     function sleep(ms) {
@@ -136,449 +106,135 @@
         return isNaN(n) ? (fallback || 0) : n;
     }
 
-    // ---------------------------------------------------------------------
-    // BLE transport (Web Bluetooth)
-
-    function BleTransport() {
-        this.device = null;
-        this.server = null;
-        this.chars = {};
-        this.queue = Promise.resolve();
-        this.onDisconnect = null;
-        this.streamsState = false; // state/motion have to be polled
-    }
-
-    BleTransport.prototype.connect = async function () {
-        if (!navigator.bluetooth) {
-            throw new Error('Web Bluetooth wird von diesem Browser ' +
-                'nicht unterstützt. Bitte Chrome oder Edge verwenden.');
-        }
-        this.device = await navigator.bluetooth.requestDevice({
-            filters: [
-                {namePrefix: 'Calliope mini'},
-                {namePrefix: 'BBC micro:bit'},
-                {services: [SERVICE]}
-            ],
-            optionalServices: [SERVICE]
-        });
-        this.device.addEventListener(
-            'gattserverdisconnected',
-            () => this.handleDisconnect()
-        );
-        this.server = await this.device.gatt.connect();
-        var service = await this.server.getPrimaryService(SERVICE),
-            list = await service.getCharacteristics();
-        list.forEach(c => {
-            this.chars[parseInt(c.uuid.slice(4, 8), 16)] = c;
-        });
-    };
-
-    BleTransport.prototype.enqueue = function (job) {
-        // GATT operations must not overlap
-        var result = this.queue.then(job);
-        this.queue = result.catch(() => null);
-        return result;
-    };
-
-    BleTransport.prototype.read = function (ch) {
-        return this.enqueue(async () => {
-            var c = this.chars[ch];
-            if (!c) {throw new Error('characteristic ' + uuid(ch)); }
-            var dv = await c.readValue();
-            return new Uint8Array(dv.buffer.slice(
-                dv.byteOffset,
-                dv.byteOffset + dv.byteLength
-            ));
-        });
-    };
-
-    BleTransport.prototype.write = function (ch, bytes, gap) {
-        return this.enqueue(async () => {
-            var c = this.chars[ch];
-            if (!c) {throw new Error('characteristic ' + uuid(ch)); }
-            if (c.writeValueWithoutResponse &&
-                    c.properties.writeWithoutResponse) {
-                await c.writeValueWithoutResponse(bytes);
-            } else if (c.writeValueWithResponse) {
-                await c.writeValueWithResponse(bytes);
-            } else {
-                await c.writeValue(bytes);
-            }
-            await sleep(gap);
-        });
-    };
-
-    BleTransport.prototype.notify = function (ch, callback) {
-        var c = this.chars[ch];
-        if (!c) {return Promise.resolve(); }
-        c.addEventListener('characteristicvaluechanged', event => {
-            var dv = event.target.value;
-            callback(new Uint8Array(dv.buffer.slice(
-                dv.byteOffset,
-                dv.byteOffset + dv.byteLength
-            )));
-        });
-        return this.enqueue(() => c.startNotifications());
-    };
-
-    BleTransport.prototype.has = function (ch) {
-        return !!this.chars[ch];
-    };
-
-    BleTransport.prototype.pending = function () {
-        return 0;
-    };
-
-    BleTransport.prototype.disconnect = async function () {
-        var dev = this.device;
-        this.device = null;
-        if (dev && dev.gatt.connected) {
-            dev.gatt.disconnect();
-        }
-    };
-
-    BleTransport.prototype.handleDisconnect = function () {
-        if (this.onDisconnect) {this.onDisconnect(); }
-    };
-
-    // ---------------------------------------------------------------------
-    // Serial transport (Web Serial, USB)
-
-    function SerialTransport() {
-        this.port = null;
-        this.reader = null;
-        this.writer = null;
-        this.buffer = [];
-        this.responses = {}; // ch -> {type -> Uint8Array}
-        this.listeners = {}; // ch -> function (notify + streamed reads)
-        this.queue = Promise.resolve();
-        this.onDisconnect = null;
-        this.open = false;
-        this.streamsState = true; // firmware pushes state & motion
-    }
-
-    SerialTransport.prototype.connect = async function () {
-        if (!navigator.serial) {
-            throw new Error('Web Serial wird von diesem Browser ' +
-                'nicht unterstützt. Bitte Chrome oder Edge verwenden.');
-        }
-        this.port = await navigator.serial.requestPort({filters: [USB_FILTER]});
-        await this.port.open({baudRate: 115200});
-        this.open = true;
-        this.writer = this.port.writable.getWriter();
-        this.reader = this.port.readable.getReader();
-        this.onPortDisconnect = (event) => {
-            if (event.target === this.port) {this.handleDisconnect(); }
-        };
-        navigator.serial.addEventListener('disconnect', this.onPortDisconnect);
-        this.readLoop();
-    };
-
-    SerialTransport.prototype.readLoop = async function () {
-        try {
-            while (this.open) {
-                var result = await this.reader.read();
-                if (result.done) {break; }
-                if (result.value) {this.receive(result.value); }
-            }
-        } catch (err) {
-            // port vanished
-        }
-        if (this.open) {this.handleDisconnect(); }
-    };
-
-    SerialTransport.prototype.receive = function (chunk) {
-        var buf = this.buffer, start, type, ch, len, end, sum, i, value;
-        for (i = 0; i < chunk.length; i += 1) {buf.push(chunk[i]); }
-        while (true) {
-            start = buf.indexOf(SERIAL_SFD);
-            if (start === -1) {buf.length = 0; return; }
-            if (start > 0) {buf.splice(0, start); }
-            if (buf.length < 5) {return; }
-            type = buf[1];
-            if (type > SERIAL_RES.NOTIFY) {buf.shift(); continue; }
-            ch = (buf[2] << 8) | buf[3];
-            len = buf[4];
-            end = 5 + len;
-            if (buf.length < end + 1) {return; }
-            sum = 0;
-            for (i = 0; i < end; i += 1) {sum += buf[i]; }
-            if (sum % 0xFF !== buf[end]) {buf.shift(); continue; }
-            value = new Uint8Array(buf.slice(5, end));
-            buf.splice(0, end + 1);
-            if (!this.responses[ch]) {this.responses[ch] = {}; }
-            this.responses[ch][type] = value;
-            if ((type === SERIAL_RES.NOTIFY || type === SERIAL_RES.READ) &&
-                    this.listeners[ch]) {
-                this.listeners[ch](value);
-            }
-        }
-    };
-
-    SerialTransport.prototype.send = async function (bytes) {
-        await this.writer.ready;
-        await this.writer.write(bytes);
-    };
-
-    SerialTransport.prototype.enqueue = BleTransport.prototype.enqueue;
-
-    SerialTransport.prototype.read = function (ch) {
-        return this.enqueue(async () => {
-            var attempt, wait;
-            for (attempt = 0; attempt < 3; attempt += 1) {
-                if (this.responses[ch]) {
-                    this.responses[ch][SERIAL_RES.READ] = null;
-                }
-                await this.send(new Uint8Array(
-                    [SERIAL_SFD, SERIAL_REQ.READ, ch >> 8, ch & 0xFF]
-                ));
-                for (wait = 0; wait < 50; wait += 1) {
-                    await sleep(10);
-                    if (this.responses[ch] &&
-                            this.responses[ch][SERIAL_RES.READ]) {
-                        return this.responses[ch][SERIAL_RES.READ];
-                    }
-                }
-            }
-            throw new Error('Calliope mini antwortet nicht (USB)');
-        });
-    };
-
-    SerialTransport.prototype.write = function (ch, bytes, gap) {
-        return this.enqueue(async () => {
-            var frame = new Uint8Array(6 + bytes.length), sum = 0, i;
-            frame[0] = SERIAL_SFD;
-            frame[1] = SERIAL_REQ.WRITE;
-            frame[2] = ch >> 8;
-            frame[3] = ch & 0xFF;
-            frame[4] = bytes.length;
-            frame.set(bytes, 5);
-            for (i = 0; i < frame.length - 1; i += 1) {sum += frame[i]; }
-            frame[frame.length - 1] = sum % 0xFF;
-            await this.send(frame);
-            await sleep(gap);
-        });
-    };
-
-    SerialTransport.prototype.notify = function (ch, callback) {
-        // the firmware starts notifications automatically on serial
-        this.listeners[ch] = callback;
-        return Promise.resolve();
-    };
-
-    SerialTransport.prototype.has = function (ch) {
-        // serial frames carry no characteristic table; listening costs nothing
-        return ch !== CH.ANALOG_IN[1] && ch !== CH.ANALOG_IN[2];
-    };
-
-    SerialTransport.prototype.disconnect = async function () {
-        if (!this.open) {return; }
-        this.open = false;
-        navigator.serial.removeEventListener(
-            'disconnect',
-            this.onPortDisconnect
-        );
-        try {await this.reader.cancel(); } catch (e) {/* ignore */}
-        try {this.reader.releaseLock(); } catch (e) {/* ignore */}
-        try {await this.writer.close(); } catch (e) {/* ignore */}
-        try {this.writer.releaseLock(); } catch (e) {/* ignore */}
-        try {await this.port.close(); } catch (e) {/* ignore */}
-        this.port = null;
-    };
-
-    SerialTransport.prototype.handleDisconnect = function () {
-        var cb = this.onDisconnect;
-        this.disconnect();
-        if (cb) {cb(); }
-    };
-
-    // ---------------------------------------------------------------------
-    // Remote transport (host page, e.g. Calliope Campus)
-    // The host forwards every access to the device it is connected to (over
-    // its own Bluetooth or USB link) and answers reads with empty bytes when
-    // there is none. Subscriptions are durable on the host side, it re-arms
-    // them after every reconnect, so they are sent once per characteristic.
-
-    var READ_TIMEOUT = 2000;
-
-    function remoteHostConfig() {
-        // answers {parentOrigin} when Snap! runs embedded in a host page
-        var params, origin, wrapper;
-        try {
-            params = new URLSearchParams(window.location.search);
-            origin = params.get('parentOrigin');
-            if (origin && window.parent !== window) {
-                return {parentOrigin: origin.trim()};
-            }
-        } catch (err) {/* ignore */}
-        try {
-            wrapper = window.SnapCalliopeHost;
-            if (wrapper && wrapper.parentOrigin && window.parent !== window) {
-                return {parentOrigin: wrapper.parentOrigin};
-            }
-        } catch (err) {/* ignore */}
-        return null;
-    }
-
     function toBase64(bytes) {
-        var s = '', i;
-        for (i = 0; i < bytes.length; i += 1) {
-            s += String.fromCharCode(bytes[i]);
-        }
-        return btoa(s);
+        return btoa(String.fromCharCode.apply(null, bytes));
     }
 
     function fromBase64(b64) {
-        var raw, out, i;
-        if (!b64) {return new Uint8Array(0); }
-        raw = atob(b64);
-        out = new Uint8Array(raw.length);
-        for (i = 0; i < raw.length; i += 1) {out[i] = raw.charCodeAt(i); }
-        return out;
+        var raw = b64 ? atob(b64) : '';
+        return Uint8Array.from(raw, c => c.charCodeAt(0));
     }
 
-    function RemoteTransport(config) {
-        this.origin = config.parentOrigin;
+    function view(bytes) {
+        return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    }
+
+    var lastStamp = 0;
+
+    function stamp() {
+        // strictly increasing, so two equal events never look like one
+        lastStamp = Math.max(Date.now(), lastStamp + 1);
+        return lastStamp;
+    }
+
+    function hostOrigin() {
+        var origin = new URLSearchParams(location.search).get('parentOrigin');
+        return origin && window.parent !== window ? origin.trim() : null;
+    }
+
+    // ---------------------------------------------------------------------
+    // link to the host
+
+    function Link(origin) {
+        this.origin = origin;
+        this.active = true;
         this.nextReqId = 1;
         this.pendingReads = new Map(); // reqId -> resolve
         this.listeners = {}; // characteristic uuid -> callback
-        this.subscribed = {}; // characteristic uuid -> true
-        this.queue = Promise.resolve();
-        this.onDisconnect = null;
-        this.streamsState = true; // the firmware notifies state & motion
-        this.active = true; // false while the host shows another editor
-        this.onHostMessage = null; // connection signals, see Calliope
+        this.writes = Promise.resolve(); // commands go out one at a time
+        this.onSignal = null; // other calliope.* messages
         window.addEventListener('message', event => this.receive(event));
     }
 
-    RemoteTransport.prototype.post = function (message) {
-        try {
-            window.parent.postMessage(message, this.origin);
-        } catch (err) {
-            // the host went away; nothing to do
-        }
+    Link.prototype.post = function (message) {
+        window.parent.postMessage(message, this.origin);
     };
 
-    RemoteTransport.prototype.receive = function (event) {
+    Link.prototype.receive = function (event) {
         var data = event.data, resolve, cb;
         if (event.source !== window.parent ||
-                (this.origin !== '*' && event.origin !== this.origin)) {
-            return;
-        }
-        if (!data || typeof data !== 'object' ||
-                typeof data.type !== 'string' ||
-                data.type.indexOf('calliope.') !== 0) {
+                (this.origin !== '*' && event.origin !== this.origin) ||
+                !data || typeof data.type !== 'string' ||
+                !data.type.startsWith('calliope.')) {
             return;
         }
         if (data.type === 'calliope.readResult') {
             resolve = this.pendingReads.get(data.reqId);
-            if (resolve) {
-                this.pendingReads.delete(data.reqId);
-                resolve(fromBase64(data.message));
-            }
+            if (resolve) {resolve(fromBase64(data.message)); }
         } else if (data.type === 'calliope.notify') {
             cb = this.listeners[String(data.characteristicId).toLowerCase()];
             if (cb) {cb(fromBase64(data.message)); }
-        } else if (data.type === 'calliope.setActive') {
-            this.active = data.active !== false;
-            if (this.onHostMessage) {this.onHostMessage(data); }
-        } else if (this.onHostMessage) {
-            this.onHostMessage(data);
+        } else if (this.onSignal) {
+            this.onSignal(data);
         }
     };
 
-    RemoteTransport.prototype.connect = function () {
-        return Promise.resolve(); // the host owns the connection
-    };
-
-    RemoteTransport.prototype.enqueue = BleTransport.prototype.enqueue;
-
-    RemoteTransport.prototype.read = function (ch) {
+    Link.prototype.read = function (ch) {
+        // answers the bytes, empty without a device
         if (!this.active) {return Promise.resolve(new Uint8Array(0)); }
-        return this.enqueue(() => new Promise(resolve => {
-            var reqId = this.nextReqId;
-            this.nextReqId += 1;
-            this.pendingReads.set(reqId, resolve);
-            setTimeout(() => {
-                if (this.pendingReads.get(reqId) === resolve) {
+        return new Promise(resolve => {
+            var reqId = this.nextReqId,
+                done = bytes => {
                     this.pendingReads.delete(reqId);
-                    resolve(new Uint8Array(0));
-                }
-            }, READ_TIMEOUT);
-            this.post({
-                type: 'calliope.read',
-                serviceId: SERVICE,
-                characteristicId: uuid(ch),
-                reqId: reqId
-            });
-        }));
-    };
-
-    RemoteTransport.prototype.write = function (ch, bytes, gap) {
-        if (!this.active) {return Promise.resolve(); }
-        return this.enqueue(async () => {
-            this.post({
-                type: 'calliope.write',
-                serviceId: SERVICE,
-                characteristicId: uuid(ch),
-                message: toBase64(bytes),
-                encoding: 'base64',
-                withResponse: false
-            });
-            await sleep(gap);
+                    clearTimeout(timer);
+                    resolve(bytes);
+                },
+                timer = setTimeout(() => done(new Uint8Array(0)),
+                    READ_TIMEOUT);
+            this.nextReqId += 1;
+            this.pendingReads.set(reqId, done);
+            this.post({type: 'calliope.read', serviceId: SERVICE,
+                characteristicId: uuid(ch), reqId: reqId});
         });
     };
 
-    RemoteTransport.prototype.notify = function (ch, callback) {
-        var id = uuid(ch);
-        this.listeners[id] = callback;
-        if (!this.subscribed[id]) {
-            this.subscribed[id] = true;
-            this.post({
-                type: 'calliope.subscribe',
-                serviceId: SERVICE,
-                characteristicId: id
-            });
-        }
-        return Promise.resolve();
+    Link.prototype.write = function (ch, bytes, acknowledged, gap) {
+        // resolves once the command is out and the device had time for it
+        var job = () => {
+            if (!this.active) {return; }
+            this.post({type: 'calliope.write', serviceId: SERVICE,
+                characteristicId: uuid(ch), message: toBase64(bytes),
+                encoding: 'base64', withResponse: acknowledged});
+            return sleep(gap);
+        };
+        this.writes = this.writes.then(job);
+        return this.writes;
     };
 
-    RemoteTransport.prototype.has = function (ch) {
-        return CONSOLIDATED.indexOf(ch) > -1;
-    };
-
-    RemoteTransport.prototype.disconnect = function () {
-        // the host keeps its link; answer pending reads so nothing hangs
-        this.pendingReads.forEach(resolve => resolve(new Uint8Array(0)));
-        this.pendingReads.clear();
-        return Promise.resolve();
-    };
-
-    RemoteTransport.prototype.reportStatus = function (status) {
-        // runtime version of the device's Blocks program, for the host's
-        // "outdated program" hint
-        this.post(Object.assign({type: 'snap.runtimeVersion'}, status));
+    Link.prototype.subscribe = function (ch, callback) {
+        // the host keeps subscriptions across reconnects and flashes
+        this.listeners[uuid(ch)] = callback;
+        this.post({type: 'calliope.subscribe', serviceId: SERVICE,
+            characteristicId: uuid(ch)});
     };
 
     // ---------------------------------------------------------------------
-    // Calliope mini device
+    // Calliope mini
 
-    function Calliope() {
-        this.transport = null;
-        this.status = 'disconnected'; // 'connecting', 'connected', 'error'
-        this.error = '';
-        this.connectionEvents = {connected: 0, disconnected: 0};
-        this.remote = null; // RemoteTransport when a host owns the link
-        this.hostConnected = false; // the host's link, in remote mode
-        this.reset();
+    function Calliope(link) {
+        this.link = link;
+        this.hardware = 2;
+        this.route = ROUTE.BLE;
+        this.runtimeVersion = undefined; // unknown until COMMAND answers
+        this.stateSubscribed = false;
+        this.lastStateNotify = 0;
+        this.ticks = 0;
+        this.connectedAt = 0; // when "when connected" last fired
+        this.connectTimer = null;
+        this.displayGeneration = 0;
+        this.resistiveTouch = false;
+        this.resetDeviceState();
+        this.resetSession();
+        if (link) {
+            link.onSignal = msg => this.signal(msg);
+            link.subscribe(CH.SENSOR_EVENT, data => this.parseEvent(data));
+            setTimeout(() => this.recheck().then(() => this.update()),
+                HANDSHAKE_DELAY);
+        }
     }
 
-    Calliope.prototype.reset = function () {
-        this.hardware = 0;
-        this.route = 0;
-        this.runtimeVersion = 0;
-        this.commandGap = 30;
-        this.updateInterval = 50;
+    Calliope.prototype.resetDeviceState = function () {
+        // what the device reported; gone with the device
         this.digitalLevel = {};
         this.buttonState = {};
         this.lightLevel = 0;
@@ -589,485 +245,418 @@
         this.acceleration = {x: 0, y: 0, z: 0};
         this.compassHeading = 0;
         this.magneticForce = {x: 0, y: 0, z: 0};
-        this.analogValue = {};
-        this.analogUpdated = {};
-        this.analogPending = {};
-        this.buttonEvents = {}; // name -> event -> timestamp
-        this.gestureEvents = {}; // name -> timestamp
-        this.pinEvents = {}; // pin -> event -> {value, timestamp}
-        this.receivedData = {};
-        this.config = {mic: false, pinMode: {}, touchRequested: {}};
-        this.lastData = Date.now();
-        this.lastStateData = 0;
+        this.analogValue = [0, 0, 0, 0];
+        this.analogUpdated = 0;
+        this.analogPending = null;
+        this.buttonEvents = {}; // name -> event -> stamp
+        this.gestureEvents = {}; // name -> stamp
+        this.pinEvents = {}; // pin -> event -> {value, stamp}
+        this.mic = false;
+        this.pinMode = {}; // pin -> 'INPUT', 'OUTPUT', 'PWM', 'SERVO', 'TOUCH'
+        this.armAttempt = {}; // touch pad -> ms of the last attempt
+        this.pinEventArmed = {}; // pin -> type the device is believed to have
+        this.pinEventAttempt = {}; // pin -> ms of the last attempt
     };
 
-    Calliope.prototype.isConnected = function () {
-        return this.status === 'connected';
+    Calliope.prototype.resetSession = function () {
+        // what the program asked for; a newly opened project starts over
+        this.touchWanted = new Set(); // touch pads 0..3 the program reads
+        this.pinEventWanted = {}; // pin -> pin event type
+        this.resistiveTouch = false;
+        this.pinMode = {};
+        this.armAttempt = {};
+        this.pinEventArmed = {};
+        this.pinEventAttempt = {};
     };
 
-    Calliope.prototype.connect = function (route) {
-        if (this.remote) {
-            // the host's connection widget owns the link
-            if (this.isConnected() || this.status === 'connecting') {return; }
-            if (this.hostConnected) {
-                this.remoteUp();
-            } else {
-                this.status = 'error';
-                this.error = 'Verbinde den Calliope mini oben ' +
-                    'über die Verbindungsanzeige.';
-            }
-            return;
-        }
-        if (this.status === 'connecting') {return; }
-        var useSerial = /usb|serial|kabel/i.test(String(route));
-        this.disconnect(true);
-        this.status = 'connecting';
-        this.error = '';
-        this.transport = useSerial ? new SerialTransport() : new BleTransport();
-        this.transport.onDisconnect = () => this.lost();
-        this.transport.connect()
-            .then(() => this.handshake())
-            .catch(err => {
-                var t = this.transport;
-                this.transport = null;
-                if (t) {t.disconnect(); }
-                this.status = 'error';
-                this.error = err && err.name === 'NotFoundError' ?
-                    'Kein Calliope mini ausgewählt.'
-                    : String(err && err.message ? err.message : err);
-            });
-    };
-
-    Calliope.prototype.handshake = async function () {
-        var t = this.transport, data;
-        this.reset();
-        data = await t.read(CH.COMMAND);
-        if (t !== this.transport) {return; } // disconnected meanwhile
-        if (!data || data.length < 3) {
-            // no answer: the device runs no Blocks program (yet)
-            throw new Error('Auf dem Calliope mini läuft kein ' +
-                'Blocks-Programm.');
-        }
-        this.hardware = data[0];
-        this.route = data[2];
-        this.runtimeVersion = data.length > 3 ? data[3] : 0;
-        this.commandGap = this.route === ROUTE_SERIAL ? 100 : 30;
-        this.updateInterval = this.hardware === HW_V1 ? 100 : 50;
-        if (t.reportStatus) {
-            t.reportStatus({
-                runtimeVersion: this.runtimeVersion,
-                hardware: this.hardware
-            });
-        }
-        if (t.streamsState) {
-            t.notify(CH.STATE, value => this.parseState(value));
-            t.notify(CH.MOTION, value => this.parseMotion(value));
-        }
-        if (t.has(CH.ACTION_EVENT)) {
-            await t.notify(CH.ACTION_EVENT, value => this.parseNotify(value));
-        }
-        await t.notify(CH.PIN_EVENT, value => this.parseNotify(value));
-        if (this.hardware !== HW_V1 && t.has(CH.MESSAGE)) {
-            await t.notify(CH.MESSAGE, value => this.parseNotify(value));
-        }
-        if (t !== this.transport) {return; } // disconnected meanwhile
-        this.status = 'connected';
-        this.connectionEvents.connected = stamp();
-        this.lastData = Date.now();
-        this.startUpdater();
-    };
-
-    Calliope.prototype.startUpdater = function () {
-        var t = this.transport,
-            loop = async () => {
-                while (this.transport === t && this.isConnected()) {
-                    try {
-                        // poll when the device does not stream, or when its
-                        // stream has paused (a notification got lost)
-                        if (!t.streamsState ||
-                                Date.now() - this.lastStateData > 250) {
-                            this.parseState(await t.read(CH.STATE));
-                            this.parseMotion(await t.read(CH.MOTION));
-                        }
-                    } catch (err) {
-                        // ignore single failures, watchdog handles the rest
-                    }
-                    // a host tells when its link drops; empty answers while
-                    // it shows another editor are no lost connection
-                    if (!this.remote &&
-                            Date.now() - this.lastData > DATA_TIMEOUT) {
-                        this.lost();
-                        return;
-                    }
-                    await sleep(this.updateInterval);
-                }
-            };
-        loop();
-    };
-
-    Calliope.prototype.lost = function () {
-        if (this.status !== 'connected' && this.status !== 'connecting') {
-            return;
-        }
-        this.disconnect();
-        this.status = 'error';
-        this.error = 'Verbindung zum Calliope mini verloren.';
-    };
-
-    Calliope.prototype.disconnect = function (silent) {
-        var t = this.transport,
-            wasConnected = this.isConnected();
-        if (this.remote) {
-            // in a host page the link belongs to the host
-            return;
-        }
-        this.transport = null;
-        if (t) {
-            t.onDisconnect = null;
-            t.disconnect();
-        }
-        if (!silent || wasConnected) {
-            this.status = 'disconnected';
-        }
-        if (wasConnected) {
-            this.connectionEvents.disconnected = stamp();
-        }
-    };
-
-    // remote mode: mirror the host's connection --------------------------
-
-    Calliope.prototype.useRemote = function (config) {
-        this.remote = new RemoteTransport(config);
-        this.remote.onHostMessage = msg => this.hostMessage(msg);
-    };
-
-    Calliope.prototype.hostMessage = function (msg) {
+    Calliope.prototype.signal = function (msg) {
         switch (msg.type) {
-        case 'calliope.connection':
-            // the host's link came up or went down
-            this.hostConnected = !!msg.connected;
-            if (this.hostConnected) {
-                this.remoteUp();
-            } else {
-                this.remoteDown();
+        case 'calliope.setActive':
+            var wasActive = this.link.active;
+            this.link.active = msg.active !== false;
+            if (this.link.active && !wasActive) {
+                // the device may have changed while nobody looked
+                this.rehandshake();
             }
+            break;
+        case 'calliope.rehandshake':
+            this.rehandshake();
             break;
         case 'calliope.onConnect':
-        case 'calliope.rehandshake':
-            // the host (re)connected or flashed the device: read COMMAND
-            // again, which also re-reports the runtime version
-            this.hostConnected = true;
-            this.remoteUp(true);
+            this.greet();
             break;
-        case 'calliope.setActive':
-            if (msg.active !== false && this.hostConnected) {
-                this.remoteUp(true);
-            }
+        case 'calliope.rearmInputs':
+            this.rearmInputs();
             break;
         case 'calliope.disconnect':
-            this.hostConnected = false;
-            this.remoteDown();
+            this.resetDeviceState();
             break;
         }
     };
 
-    Calliope.prototype.remoteUp = function (again) {
-        if (this.status === 'connecting') {return; }
-        if (this.isConnected()) {
-            if (!again) {return; }
-            // keep the connection, just refresh what COMMAND tells
-            this.remote.read(CH.COMMAND).then(data => {
-                if (data && data.length > 3) {
-                    this.runtimeVersion = data[3];
-                    this.remote.reportStatus({
-                        runtimeVersion: this.runtimeVersion,
-                        hardware: data[0]
-                    });
-                }
-            });
-            return;
-        }
-        this.status = 'connecting';
-        this.error = '';
-        this.transport = this.remote;
-        this.handshake().catch(err => {
-            if (this.transport !== this.remote) {return; }
-            this.transport = null;
-            this.status = 'error';
-            this.error = String(err && err.message ? err.message : err);
-        });
+    // handshake -----------------------------------------------------------
+
+    Calliope.prototype.rehandshake = function () {
+        this.runtimeVersion = undefined; // so the version is reported again
+        this.recheck();
     };
 
-    Calliope.prototype.remoteDown = function () {
-        var wasConnected = this.isConnected();
-        this.transport = null;
-        if (this.remote) {this.remote.disconnect(); }
-        this.status = 'disconnected';
-        this.error = '';
-        if (wasConnected) {
-            this.connectionEvents.disconnected = stamp();
+    Calliope.prototype.recheck = async function () {
+        // COMMAND: hardware, protocol, route, runtime version, armed touch
+        // pads (bit n = Pn), armed pin events (bit n = pin n, 3 bytes)
+        var data = await this.link.read(CH.COMMAND), version;
+        if (data.length < 3) {return; } // no device or no Blocks program
+        if (data.length >= 5) {this.reconcileTouch(data[4]); }
+        if (data.length >= 8) {
+            this.reconcilePinEvents(data[5] | (data[6] << 8) |
+                (data[7] << 16));
+        }
+        version = data.length > 3 ? data[3] : 0;
+        if (version === this.runtimeVersion) {return; }
+        this.hardware = data[0];
+        this.route = data[2];
+        this.runtimeVersion = version;
+        if (version >= V2_FEATURES && !this.stateSubscribed) {
+            this.stateSubscribed = true;
+            this.link.subscribe(CH.STATE, value => {
+                this.lastStateNotify = Date.now();
+                this.parseState(value);
+            });
+            this.link.subscribe(CH.MOTION, value => this.parseMotion(value));
+        }
+        // for the host's "outdated Blocks program" hint
+        this.link.post({type: 'snap.runtimeVersion',
+            runtimeVersion: version, hardware: this.hardware});
+    };
+
+    Calliope.prototype.greet = function () {
+        // the host connected a Blocks program: show "C", then fire "when
+        // connected", whose blocks may draw over it
+        clearTimeout(this.connectTimer);
+        this.displayText('C', 0);
+        this.connectTimer = setTimeout(() => {
+            this.connectedAt = stamp();
+        }, CONNECT_HAT_DELAY);
+    };
+
+    // updater -------------------------------------------------------------
+
+    Calliope.prototype.updateInterval = function () {
+        return this.hardware === HW_DAL ? 100 : 50;
+    };
+
+    Calliope.prototype.commandGap = function () {
+        if (this.route === ROUTE.DAP) {return 5; }
+        if (this.route === ROUTE.SERIAL || this.hardware === HW_DAL) {
+            return 30;
+        }
+        return 15;
+    };
+
+    Calliope.prototype.update = async function () {
+        while (true) {
+            if (this.link.active) {
+                this.ticks += 1;
+                if (this.ticks % RECHECK_TICKS === 0) {
+                    await this.recheck();
+                }
+                this.armTouch();
+                this.armPinEvents();
+                if (!this.stateSubscribed ||
+                        Date.now() - this.lastStateNotify > STATE_STALE) {
+                    this.parseState(await this.link.read(CH.STATE));
+                    this.parseMotion(await this.link.read(CH.MOTION));
+                }
+            }
+            await sleep(this.updateInterval());
         }
     };
 
     // parsing -------------------------------------------------------------
 
     Calliope.prototype.parseState = function (data) {
-        if (!data || data.length < 7) {return; }
-        var dv = new DataView(data.buffer, data.byteOffset, data.byteLength),
-            gpio = dv.getUint32(0, true);
+        if (data.length < 7) {return; }
+        var gpio = view(data).getUint32(0, true);
         GPIO.forEach(pin => {
             this.digitalLevel[pin] = (gpio >> pin) & 1;
         });
-        Object.keys(BUTTON_STATE_INDEX).forEach(name => {
-            this.buttonState[name] =
-                (gpio >> (24 + BUTTON_STATE_INDEX[name])) & 1;
+        Object.keys(STATE_BIT).forEach(name => {
+            this.buttonState[name] = (gpio >> STATE_BIT[name]) & 1;
         });
-        this.lightLevel = dv.getUint8(4);
-        this.temperature = dv.getUint8(5) - 128;
-        this.soundLevel = dv.getUint8(6);
-        this.lastData = Date.now();
-        this.lastStateData = this.lastData;
+        this.lightLevel = data[4];
+        this.temperature = data[5] - 128;
+        this.soundLevel = data[6];
     };
 
     Calliope.prototype.parseMotion = function (data) {
-        if (!data || data.length < 18) {return; }
-        var dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        this.pitch = Math.round(dv.getInt16(0, true) * 180 / Math.PI / 1000);
-        this.roll = Math.round(dv.getInt16(2, true) * 180 / Math.PI / 1000);
-        this.acceleration.x = 1000 * dv.getInt16(4, true) / G;
-        this.acceleration.y = 1000 * dv.getInt16(6, true) / G;
-        this.acceleration.z = 1000 * dv.getInt16(8, true) / G;
+        if (data.length < 18) {return; }
+        var dv = view(data),
+            degrees = mrad => Math.round(mrad * 180 / Math.PI / 1000);
+        this.pitch = degrees(dv.getInt16(0, true));
+        this.roll = degrees(dv.getInt16(2, true));
+        this.acceleration = {x: dv.getInt16(4, true) * 1000 / 1024,
+            y: dv.getInt16(6, true) * 1000 / 1024,
+            z: dv.getInt16(8, true) * 1000 / 1024};
         this.compassHeading = dv.getUint16(10, true);
-        this.magneticForce.x = dv.getInt16(12, true);
-        this.magneticForce.y = dv.getInt16(14, true);
-        this.magneticForce.z = dv.getInt16(16, true);
-        this.lastData = Date.now();
+        this.magneticForce = {x: dv.getInt16(12, true),
+            y: dv.getInt16(14, true), z: dv.getInt16(16, true)};
     };
 
-    Calliope.prototype.parseNotify = function (data) {
-        if (!data || data.length < 20) {return; }
-        var dv = new DataView(data.buffer, data.byteOffset, data.byteLength),
-            format = dv.getUint8(19),
-            decoder = new TextDecoder(),
-            name, event, pin, label;
-        this.lastData = Date.now();
-        if (format === DATA_FORMAT.ACTION_EVENT) {
-            if (dv.getUint8(0) === ACTION_EVENT.BUTTON) {
-                name = BUTTON_ID[dv.getUint16(1, true)];
-                event = BUTTON_EVENT_ID[dv.getUint8(3)];
-                if (name && event) {
-                    if (!this.buttonEvents[name]) {
-                        this.buttonEvents[name] = {};
-                    }
-                    this.buttonEvents[name][event] = stamp();
-                }
-            } else if (dv.getUint8(0) === ACTION_EVENT.GESTURE) {
-                name = GESTURE_ID[dv.getUint8(1)];
-                if (name) {this.gestureEvents[name] = stamp(); }
+    Calliope.prototype.parseEvent = function (data) {
+        if (data.length < 20) {return; }
+        var dv = view(data), name, event, pin;
+        if (data[19] === EVENT_KIND.ACTION && data[0] === ACTION.BUTTON) {
+            name = BUTTON_ID[dv.getUint16(1, true)];
+            event = BUTTON_EVENT_ID[data[3]];
+            if (name && event) {
+                this.buttonEvents[name] = this.buttonEvents[name] || {};
+                this.buttonEvents[name][event] = stamp();
             }
-        } else if (format === DATA_FORMAT.PIN_EVENT) {
-            pin = dv.getUint8(0);
-            if (!this.pinEvents[pin]) {this.pinEvents[pin] = {}; }
-            this.pinEvents[pin][dv.getUint8(1)] = {
-                value: dv.getUint32(2, true),
-                timestamp: stamp()
-            };
-        } else if (format === DATA_FORMAT.DATA_NUMBER) {
-            label = decoder.decode(data.slice(0, 8).filter(c => c !== 0));
-            this.receivedData[label] = {
-                content: dv.getFloat32(8, true),
-                timestamp: Date.now()
-            };
-        } else if (format === DATA_FORMAT.DATA_TEXT) {
-            label = decoder.decode(data.slice(0, 8).filter(c => c !== 0));
-            this.receivedData[label] = {
-                content: decoder.decode(data.slice(8, 20).filter(c => c !== 0)),
-                timestamp: Date.now()
-            };
+        } else if (data[19] === EVENT_KIND.ACTION &&
+                data[0] === ACTION.GESTURE) {
+            name = GESTURE_ID[data[1]];
+            if (name) {this.gestureEvents[name] = stamp(); }
+        } else if (data[19] === EVENT_KIND.PIN) {
+            pin = data[0];
+            this.pinEvents[pin] = this.pinEvents[pin] || {};
+            // edge: device time in µs; pulse: its duration in µs
+            this.pinEvents[pin][data[1]] = {value: dv.getUint32(2, true),
+                stamp: stamp()};
         }
     };
 
     // commands ------------------------------------------------------------
 
-    Calliope.prototype.command = function (cmd, sub, bytes) {
-        if (!this.isConnected()) {return Promise.resolve(); }
-        var t = this.transport,
-            data = new Uint8Array(1 + bytes.length);
-        data[0] = (cmd << 5) | sub;
-        data.set(bytes, 1);
-        return t.write(CH.COMMAND, data, this.commandGap)
-            .catch(() => null);
+    Calliope.prototype.command = function (cmd, sub, bytes, unacknowledged) {
+        // header (cmd << 5) | sub, payload little endian
+        return this.link.write(CH.COMMAND, [(cmd << 5) | sub].concat(bytes),
+            !unacknowledged, this.commandGap());
     };
 
     Calliope.prototype.displayText = function (text, delay) {
-        var chars = [], i, code;
-        text = String(text);
-        for (i = 0; i < Math.min(18, text.length); i += 1) {
-            code = text.charCodeAt(i);
-            chars.push(code < 128 ? code : 63); // non ascii => '?'
-        }
-        chars.push(0);
-        this.command(
-            CMD.DISPLAY,
-            DISPLAY_CMD.TEXT,
-            [clamp(Math.round(delay / 10), 0, 255)].concat(chars)
-        );
-        return delay * (6 * Math.min(18, text.length) + 6);
+        // answers how long the text scrolls, in ms
+        var chars = Array.from(String(text).slice(0, 18), c => {
+            var code = c.charCodeAt(0);
+            return code < 128 ? code : 63; // the device's font is ASCII
+        });
+        this.command(CMD.DISPLAY, DISPLAY.TEXT,
+            [clamp(Math.floor(delay / 10), 0, 255)].concat(chars, [0]));
+        return delay * (6 * chars.length + 6);
     };
 
     Calliope.prototype.displayPixels = function (levels) {
-        // levels: 25 brightness values 0..255
-        this.command(CMD.DISPLAY, DISPLAY_CMD.PIXELS_0, levels.slice(0, 15));
-        this.command(CMD.DISPLAY, DISPLAY_CMD.PIXELS_1, levels.slice(15, 25));
+        // levels: 25 brightness values 0..255, row by row from the top
+        var bits = 0;
+        if (this.runtimeVersion >= V2_FEATURES &&
+                levels.every(v => v === 0 || v === 255)) {
+            levels.forEach((v, i) => {
+                if (v) {bits |= 1 << i; }
+            });
+            this.command(CMD.DISPLAY, DISPLAY.PIXELS_PACKED,
+                [bits & 0xFF, (bits >> 8) & 0xFF, (bits >> 16) & 0xFF,
+                    (bits >>> 24) & 0xFF]);
+            return;
+        }
+        // two halves; the device shows them together when their
+        // generation bytes match
+        this.displayGeneration = (this.displayGeneration + 1) & 0xFF;
+        this.command(CMD.DISPLAY, DISPLAY.PIXELS_0,
+            levels.slice(0, 15).concat([this.displayGeneration]));
+        this.command(CMD.DISPLAY, DISPLAY.PIXELS_1,
+            levels.slice(15, 25).concat([this.displayGeneration]));
     };
 
     Calliope.prototype.setRGB = function (colors) {
-        var bytes = [];
-        colors.forEach(rgb => bytes.push(rgb[0], rgb[1], rgb[2]));
-        this.command(CMD.RGB, 0, bytes);
+        this.command(CMD.RGB, 0, [].concat.apply([], colors));
     };
 
     Calliope.prototype.setMotor = function (motor, speed) {
-        var sub = motor === 'm0' ? MOTOR_CMD.M0
-                : (motor === 'm1' ? MOTOR_CMD.M1 : MOTOR_CMD.M0_M1);
-        speed = clamp(Math.round(speed), -100, 100);
-        this.command(CMD.MOTOR, sub, [speed < 0 ? 1 : 0, Math.abs(speed)]);
+        speed = Math.trunc(clamp(speed, -100, 100));
+        this.command(CMD.MOTOR, MOTOR[motor] || MOTOR.m0m1,
+            [speed < 0 ? 1 : 0, Math.abs(speed)]);
     };
 
     Calliope.prototype.setPull = function (pin, mode) {
-        this.config.pinMode[pin] = 'INPUT';
-        this.command(CMD.PIN, PIN_CMD.SET_PULL, [pin, mode]);
+        this.pinMode[pin] = 'INPUT';
+        this.command(CMD.PIN, PIN.PULL, [pin, mode]);
     };
 
-    Calliope.prototype.setOutput = function (pin, level) {
-        this.config.pinMode[pin] = 'OUTPUT';
-        this.command(CMD.PIN, PIN_CMD.SET_OUTPUT, [pin, level ? 1 : 0]);
+    Calliope.prototype.setOutput = function (pin, high) {
+        this.pinMode[pin] = 'OUTPUT';
+        this.command(CMD.PIN, PIN.OUTPUT, [pin, high ? 1 : 0]);
     };
 
     Calliope.prototype.setPWM = function (pin, level) {
-        this.config.pinMode[pin] = 'PWM';
-        this.command(
-            CMD.PIN,
-            PIN_CMD.SET_PWM,
-            [pin, level & 0xFF, (level >> 8) & 0xFF]
-        );
+        this.pinMode[pin] = 'PWM';
+        this.command(CMD.PIN, PIN.PWM, [pin, level & 0xFF, level >> 8]);
     };
 
     Calliope.prototype.setServo = function (pin, angle) {
-        this.config.pinMode[pin] = 'SERVO';
-        this.command(
-            CMD.PIN,
-            PIN_CMD.SET_SERVO,
-            [pin, angle & 0xFF, (angle >> 8) & 0xFF, 0, 0, 0, 0]
-        );
-    };
-
-    Calliope.prototype.listenPinEvent = function (pin, type) {
-        this.command(CMD.PIN, PIN_CMD.SET_EVENT, [pin, type]);
+        // range and centre 0: the firmware's defaults
+        this.pinMode[pin] = 'SERVO';
+        this.command(CMD.PIN, PIN.SERVO, [pin, angle & 0xFF, angle >> 8,
+            0, 0, 0, 0]);
     };
 
     Calliope.prototype.playTone = function (freq, volume) {
-        var period = Math.round(1000000 / Math.max(1, freq));
-        this.command(CMD.AUDIO, AUDIO_CMD.PLAY_TONE, [
-            period & 0xFF,
-            (period >> 8) & 0xFF,
-            (period >> 16) & 0xFF,
-            (period >> 24) & 0xFF,
-            Math.round(clamp(volume, 0, 100) * 0xFF / 100)
-        ]);
+        // no duration: the tone plays until "stop tone"
+        var period = freq > 0 ? Math.round(1000000 / freq) : 0;
+        this.command(CMD.AUDIO, AUDIO.PLAY, [period & 0xFF,
+            (period >> 8) & 0xFF, (period >> 16) & 0xFF,
+            (period >>> 24) & 0xFF,
+            Math.round(clamp(volume, 0, 100) * 255 / 100)]);
     };
 
     Calliope.prototype.stopTone = function () {
-        this.command(CMD.AUDIO, AUDIO_CMD.STOP_TONE, []);
+        this.command(CMD.AUDIO, AUDIO.STOP, []);
     };
 
     Calliope.prototype.ensureMic = function () {
-        if (this.isConnected() && !this.config.mic) {
-            this.config.mic = true;
-            this.command(CMD.CONFIG, CONFIG_CMD.MIC, [1]);
+        if (!this.mic) {
+            this.mic = true;
+            this.command(CMD.CONFIG, CONFIG.MIC, [1], true);
         }
     };
 
-    Calliope.prototype.ensureTouch = function (name) {
-        var pin = BUTTON_PIN_INDEX[name];
-        if (pin === undefined || !this.isConnected()) {return; }
-        if (this.config.pinMode[pin] === 'TOUCH') {return; }
-        if (Date.now() - (this.config.touchRequested[pin] || 0) < 1000) {
-            return;
-        }
-        this.config.touchRequested[pin] = Date.now();
-        this.command(CMD.CONFIG, CONFIG_CMD.TOUCH, [pin, 1]).then(() => {
-            this.config.pinMode[pin] = 'TOUCH';
-        });
+    Calliope.prototype.ensureInput = function (pin, pull) {
+        if (this.pinMode[pin] !== 'INPUT') {this.setPull(pin, pull); }
     };
 
     Calliope.prototype.analog = function (pin) {
-        // answers the value 0..1023 or -1 while a request is pending
-        var t = this.transport,
-            // older firmware: one characteristic per pin; consolidated:
-            // all pins packed into the first one
-            perPin = t && t.has(CH.ANALOG_IN[1]),
-            ch = perPin ? CH.ANALOG_IN[pin] : CH.ANALOG_IN[0],
-            offset = perPin ? 0 : pin * 2;
-        if (!this.isConnected() || CH.ANALOG_IN[pin] === undefined) {
-            return 0;
-        }
-        if (Date.now() - (this.analogUpdated[pin] || 0) < 100) {
+        // answers P0..P3 as 0..1023, or -1 while the device is asked
+        if (Date.now() - this.analogUpdated < 100) {
             return this.analogValue[pin];
         }
-        if (this.analogPending[pin]) {return -1; }
-        if (this.config.pinMode[pin] !== 'INPUT') {
-            this.setPull(pin, PULL.NONE);
+        this.ensureInput(pin, PULL.NONE);
+        if (!this.analogPending) {
+            this.analogPending = this.link.read(CH.ANALOG_IN).then(data => {
+                var dv = view(data);
+                this.analogValue = [0, 1, 2, 3].map(p =>
+                    data.length >= p * 2 + 2 ? dv.getUint16(p * 2, true) : 0);
+                this.analogUpdated = Date.now();
+                this.analogPending = null;
+            });
         }
-        this.analogPending[pin] = true;
-        t.read(ch).then(data => {
-            var dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-            this.analogValue[pin] = data.length >= offset + 2 ?
-                    dv.getUint16(offset, true) : 0;
-        }).catch(() => {
-            this.analogValue[pin] = this.analogValue[pin] || 0;
-        }).finally(() => {
-            this.analogUpdated[pin] = Date.now();
-            this.analogPending[pin] = false;
-        });
         return -1;
+    };
+
+    // arming touch pads and pin events -------------------------------------
+    // The program states what it wants; the updater arms it, one pad per
+    // tick, and the COMMAND bitmaps tell what the device has armed (they go
+    // when it resets).
+
+    Calliope.prototype.wantTouch = function (pin) {
+        this.touchWanted.add(pin);
+        return this.pinMode[pin] === 'TOUCH';
+    };
+
+    Calliope.prototype.armTouch = function () {
+        var now = Date.now(),
+            pin = Array.from(this.touchWanted).find(p =>
+                !this.pinMode[p] || this.pinMode[p] === 'INPUT');
+        if (pin === undefined || now - (this.armAttempt[pin] || 0) < ARM_RETRY) {
+            return;
+        }
+        this.armAttempt[pin] = now;
+        this.command(CMD.CONFIG, CONFIG.TOUCH,
+            [pin, 1, this.resistiveTouch ? 1 : 0], true).then(() => {
+                this.pinMode[pin] = 'TOUCH';
+            });
+    };
+
+    Calliope.prototype.reconcileTouch = function (armed) {
+        [0, 1, 2, 3].forEach(pin => {
+            var bit = (armed >> pin) & 1;
+            if (this.pinMode[pin] === 'TOUCH' && !bit) {
+                delete this.pinMode[pin]; // the device reset: arm again
+                delete this.armAttempt[pin];
+            } else if (this.pinMode[pin] !== 'TOUCH' && bit &&
+                    this.touchWanted.has(pin) && this.armAttempt[pin]) {
+                this.pinMode[pin] = 'TOUCH';
+            }
+        });
+    };
+
+    Calliope.prototype.setTouchType = function (resistive) {
+        // the updater arms the pads again with the new type
+        this.resistiveTouch = resistive;
+        [0, 1, 2, 3].forEach(pin => {
+            if (this.pinMode[pin] === 'TOUCH') {delete this.pinMode[pin]; }
+            delete this.armAttempt[pin];
+        });
+    };
+
+    Calliope.prototype.listenPinEvent = function (pin, type) {
+        if (type === PIN_EVENT_TYPE.NONE) {
+            delete this.pinEventWanted[pin];
+        } else {
+            this.pinEventWanted[pin] = type;
+        }
+        this.pinEventArmed[pin] = type;
+        this.pinEventAttempt[pin] = Date.now();
+        this.command(CMD.PIN, PIN.EVENT, [pin, type], true);
+    };
+
+    Calliope.prototype.armPinEvents = function () {
+        var now = Date.now();
+        Object.keys(this.pinEventWanted).forEach(pin => {
+            var type = this.pinEventWanted[pin];
+            if (this.pinEventArmed[pin] !== type &&
+                    now - (this.pinEventAttempt[pin] || 0) >= ARM_RETRY) {
+                this.listenPinEvent(Number(pin), type);
+            }
+        });
+    };
+
+    Calliope.prototype.reconcilePinEvents = function (armed) {
+        var now = Date.now();
+        Object.keys(this.pinEventArmed).forEach(pin => {
+            if (this.pinEventArmed[pin] && !((armed >> pin) & 1) &&
+                    now - (this.pinEventAttempt[pin] || 0) >=
+                        PIN_EVENT_GRACE) {
+                delete this.pinEventArmed[pin];
+                delete this.pinEventAttempt[pin];
+            }
+        });
+    };
+
+    Calliope.prototype.rearmInputs = function () {
+        // the device ignores arming a pad that is armed already: off first
+        this.touchWanted.forEach(pin => {
+            this.command(CMD.CONFIG, CONFIG.TOUCH, [pin, 0], true);
+            delete this.pinMode[pin];
+            delete this.armAttempt[pin];
+        });
+        this.pinEventArmed = {};
+        this.pinEventAttempt = {};
+        this.armTouch();
+        this.armPinEvents();
     };
 
     // ---------------------------------------------------------------------
     // edge detection for event hat blocks
     // Each hat block (the top block of the evaluating process) remembers
-    // the last event it has seen, so several hats can react to the same
-    // event independently. A hat only reacts to events which arrive after
-    // it started watching.
+    // the last event it has seen, so several hats react to the same event
+    // independently, and only to events after it started watching.
 
     var globalSeen = {};
 
-    function isNewEvent(proc, key, timestamp) {
-        var owner = proc && proc.topBlock ? proc.topBlock : null,
-            seen = globalSeen;
-        if (owner) {
-            if (!owner.calliopeSeen) {owner.calliopeSeen = {}; }
-            seen = owner.calliopeSeen;
-        }
-        timestamp = timestamp || 0;
-        if (seen[key] === undefined) {
-            seen[key] = timestamp;
+    function isNewEvent(proc, key, eventStamp) {
+        var owner = proc && proc.topBlock,
+            seen = owner ?
+                    owner.calliopeSeen || (owner.calliopeSeen = {})
+                    : globalSeen;
+        eventStamp = eventStamp || 0;
+        if (seen[key] === undefined || seen[key] === eventStamp) {
+            seen[key] = eventStamp;
             return false;
         }
-        if (seen[key] === timestamp) {return false; }
-        seen[key] = timestamp;
+        seen[key] = eventStamp;
         return true;
     }
 
     // ---------------------------------------------------------------------
-    // input helpers
-
-    function listToArray(x) {
-        if (x instanceof List) {
-            return x.itemsArray().map(listToArray);
-        }
-        return x;
-    }
+    // inputs
 
     function parseColor(c) {
         var hex, m;
@@ -1080,51 +669,39 @@
         }
         hex = String(c).trim().replace(/^#/, '');
         if (/^[0-9a-f]{3}$/i.test(hex)) {
-            hex = hex.split('').map(d => d + d).join('');
+            hex = hex.replace(/./g, d => d + d);
         }
-        if (/^[0-9a-f]{6}$/i.test(hex)) {
-            return [
-                parseInt(hex.slice(0, 2), 16),
-                parseInt(hex.slice(2, 4), 16),
-                parseInt(hex.slice(4, 6), 16)
-            ];
-        }
-        return [0, 0, 0];
+        if (!/^[0-9a-f]{6}$/i.test(hex)) {return [0, 0, 0]; }
+        return [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16));
+    }
+
+    function flatten(x) {
+        return x instanceof List ?
+                [].concat.apply([], x.itemsArray().map(flatten))
+                : [x];
     }
 
     function parseMatrix(input) {
-        // accepts "01010 11111 ...", "0,50,100,...", a list of 25 values
-        // (0..100 %) or a 5x5 list
-        var values, str;
+        // "01010 11111 ..." (0 off, anything else on), "0,50,100,..." or
+        // a list of 25 values (0..100 %), or a 5x5 list
+        var str = String(input), values;
         if (input instanceof List) {
-            values = [].concat.apply([], listToArray(input).map(
-                row => Array.isArray(row) ? row : [row]
-            ));
-            values = values.map(v => clamp(num(v), 0, 100));
+            values = flatten(input).map(v => clamp(num(v), 0, 100));
+        } else if (str.includes(',')) {
+            values = str.split(/[,\n]/).map(v => clamp(num(v), 0, 100));
         } else {
-            str = String(input);
-            if (str.includes(',')) {
-                values = str.split(/[,\n]/).map(v => clamp(num(v), 0, 100));
-            } else {
-                values = str.replace(/\s/g, '').split('').map(
-                    ch => ch === '0' || ch === '.' ? 0 : 100
-                );
-            }
+            values = Array.from(str.replace(/\s/g, ''),
+                ch => ch === '0' ? 0 : 100);
         }
         while (values.length < 25) {values.push(0); }
         return values.slice(0, 25).map(v => Math.round(v * 255 / 100));
     }
 
-    // menu entries of the Snap! blocks (German, as in Scratch more)
-    // mapped to protocol names; English protocol names work as well
+    // menu entries of the blocks (German, as in the Blocks editor)
     var MENU = {
-        // button events
-        'unten': 'DOWN', 'gedrückt': 'DOWN', 'oben': 'UP',
-        'geklickt': 'CLICK', 'lange geklickt': 'LONG_CLICK',
-        'gehalten': 'HOLD', 'doppelt geklickt': 'DOUBLE_CLICK',
-        // touch events
+        // button and touch events
+        'unten': 'DOWN', 'oben': 'UP', 'geklickt': 'CLICK',
         'berührt': 'DOWN', 'losgelassen': 'UP', 'getippt': 'CLICK',
-        'lange getippt': 'LONG_CLICK', 'doppelt getippt': 'DOUBLE_CLICK',
         // gestures
         'logo nach oben': 'TILT_UP', 'logo nach unten': 'TILT_DOWN',
         'nach links gedreht': 'TILT_LEFT', 'nach rechts gedreht': 'TILT_RIGHT',
@@ -1135,266 +712,231 @@
         // pull modes
         'nichts': 'NONE', 'pullup': 'UP', 'pulldown': 'DOWN',
         // pin event types
-        'flanke': 'ON_EDGE', 'impuls': 'ON_PULSE', 'berührung': 'ON_TOUCH',
+        'flanke': 'ON_EDGE', 'impuls': 'ON_PULSE',
         // pin events
         'ansteigen': 'RISE', 'abfallen': 'FALL',
         'impuls hoch': 'PULSE_HIGH', 'impuls tief': 'PULSE_LOW',
-        // sensors
-        'lichtstärke': 'light', 'temperatur': 'temperature',
-        'kompassrichtung': 'compass', 'neigung vor/zurück': 'pitch',
-        'neigung links/rechts': 'roll', 'lautstärke': 'sound',
-        'magnetkraft': 'magnetic', 'betrag': 'absolute'
+        // axes
+        'betrag': 'absolute',
+        // touch type
+        'resistiv': 'RESISTIVE', 'kapazitiv': 'CAPACITIVE'
     };
 
     function code(choice) {
-        var key = String(choice).trim().toLowerCase();
-        return MENU[key] || String(choice).trim();
+        var text = String(choice).trim();
+        return MENU[text.toLowerCase()] || text.toUpperCase();
     }
 
     function pinNumber(p) {
         return parseInt(String(p).replace(/^[PC]/i, ''), 10) || 0;
     }
 
-    function buttonName(b) {
-        b = String(b).toUpperCase();
-        return b === 'LOGO' ? 'LOGO' : b;
+    function percent(byte, max) {
+        return Math.round(byte * 1000 / max) / 10;
+    }
+
+    function axis(vector, choice) {
+        var a = code(choice).toLowerCase();
+        if (a === 'x' || a === 'y' || a === 'z') {return Math.round(vector[a]); }
+        return Math.round(Math.hypot(vector.x, vector.y, vector.z));
     }
 
     // ---------------------------------------------------------------------
     // Snap! extension primitives
 
-    var cal = new Calliope(),
-        prims = SnapExtensions.primitives;
+    var link = hostOrigin() ? new Link(hostOrigin()) : null,
+        cal = new Calliope(link),
+        prims = SnapExtensions.primitives,
+        hinted = false;
 
-    window.SnapCalliope = cal; // for debugging and the host bridge
+    window.SnapCalliope = cal; // for the host bridge and debugging
 
-    if (remoteHostConfig()) {
-        cal.useRemote(remoteHostConfig());
+    function device(fn) {
+        // a command for the device: without a host, say once where the
+        // Calliope mini connects instead of silently doing nothing
+        return function () {
+            var ide;
+            if (link) {return fn.apply(this, arguments); }
+            if (!hinted) {
+                hinted = true;
+                // this: the sprite or stage running the block
+                ide = this.parentThatIsA ? this.parentThatIsA(IDE_Morph) : null;
+                if (ide) {
+                    ide.showMessage('Den Calliope mini verbindest du in ' +
+                        'Calliope Campus.', 4);
+                }
+            }
+            return 0;
+        };
     }
 
-    // connection
-
-    prims.set('cal_connect(route)', function (route) {
-        cal.connect(route);
+    prims.set('cal_when_connected()', function (proc) {
+        return isNewEvent(proc, 'connected', cal.connectedAt);
     });
 
-    prims.set('cal_disconnect()', function () {
-        cal.disconnect();
-    });
-
-    prims.set('cal_status()', function () {
-        return cal.status;
-    });
-
-    prims.set('cal_error()', function () {
-        return cal.error;
-    });
-
-    prims.set('cal_connected()', function () {
-        return cal.isConnected();
-    });
-
-    prims.set('cal_connection_event(state)', function (state, proc) {
-        var key = /dis|getrennt/i.test(String(state)) ? 'disconnected'
-                : 'connected';
-        return isNewEvent(proc, 'conn:' + key, cal.connectionEvents[key]);
-    });
-
-    // buttons, touch & gestures
+    // buttons, touch, gestures
 
     prims.set('cal_button_event(name, event)', function (name, event, proc) {
-        name = buttonName(name);
-        event = code(event).toUpperCase();
-        if (BUTTON_PIN_INDEX[name] !== undefined) {cal.ensureTouch(name); }
-        if (name === 'A+B') {
-            return isNewEvent(proc, 'btn:AB:' + event,
-                Math.min(
-                    (cal.buttonEvents.A || {})[event] || 0,
-                    (cal.buttonEvents.B || {})[event] || 0
-                ) && Math.max(
-                    (cal.buttonEvents.A || {})[event] || 0,
-                    (cal.buttonEvents.B || {})[event] || 0
-                ));
-        }
-        return isNewEvent(
-            proc,
-            'btn:' + name + ':' + event,
-            (cal.buttonEvents[name] || {})[event]
-        );
+        return isNewEvent(proc, 'btn:' + name + ':' + code(event),
+            (cal.buttonEvents[String(name).toUpperCase()] || {})[code(event)]);
     });
 
     prims.set('cal_button_pressed(name)', function (name) {
-        name = buttonName(name);
-        if (!cal.isConnected()) {return false; }
-        if (BUTTON_PIN_INDEX[name] !== undefined) {cal.ensureTouch(name); }
-        if (name === 'A+B') {
-            return cal.buttonState.A === 1 && cal.buttonState.B === 1;
+        return cal.buttonState[String(name).toUpperCase()] === 1;
+    });
+
+    prims.set('cal_touch_event(pin, event)', function (pin, event, proc) {
+        var name = String(pin).toUpperCase(),
+            key = 'touch:' + name + ':' + code(event),
+            armed = name === 'LOGO' || cal.wantTouch(TOUCH_PIN[name]);
+        return isNewEvent(proc, key,
+            armed ? (cal.buttonEvents[name] || {})[code(event)] : 0);
+    });
+
+    prims.set('cal_touched(pin)', function (pin) {
+        var name = String(pin).toUpperCase();
+        if (name !== 'LOGO' && !cal.wantTouch(TOUCH_PIN[name])) {
+            return false;
         }
         return cal.buttonState[name] === 1;
     });
 
+    prims.set('cal_touch_type(type)', function (type) {
+        cal.setTouchType(code(type) === 'RESISTIVE');
+    });
+
     prims.set('cal_gesture(name)', function (name, proc) {
-        name = code(name).toUpperCase();
-        return isNewEvent(proc, 'gst:' + name, cal.gestureEvents[name]);
+        return isNewEvent(proc, 'gst:' + code(name),
+            cal.gestureEvents[code(name)]);
     });
 
-    // display & LEDs
+    // display, LEDs, motors
 
-    prims.set('cal_show_pattern(matrix)', function (matrix) {
+    prims.set('cal_show_pattern(matrix)', device(function (matrix) {
         cal.displayPixels(parseMatrix(matrix));
-    });
+    }));
 
-    prims.set('cal_show_text(text, delay)', function (text, delay) {
-        // answers the scrolling duration in seconds
-        if (!cal.isConnected()) {return 0; }
+    prims.set('cal_show_text(text, delay)', device(function (text, delay) {
+        // answers the scrolling time in seconds
         delay = parseInt(delay, 10);
-        if (isNaN(delay)) {delay = 120; }
-        return cal.displayText(text, clamp(delay, 0, 2550)) / 1000;
-    });
+        return cal.displayText(text, isNaN(delay) ? 120 :
+                clamp(delay, 0, 2550)) / 1000;
+    }));
 
-    prims.set('cal_clear_display()', function () {
+    prims.set('cal_clear_display()', device(function () {
         cal.displayPixels(new Array(25).fill(0));
-    });
+    }));
 
-    prims.set('cal_rgb(c1, c2, c3)', function (c1, c2, c3) {
+    prims.set('cal_rgb(c1, c2, c3)', device(function (c1, c2, c3) {
         cal.setRGB([parseColor(c1), parseColor(c2), parseColor(c3)]);
-    });
+    }));
 
-    prims.set('cal_motor(motor, speed)', function (motor, speed) {
-        cal.setMotor(String(motor).toLowerCase(), num(speed));
-    });
+    prims.set('cal_motor(motor, speed)', device(function (motor, speed) {
+        cal.setMotor(String(motor).toLowerCase().replace(/\W/g, ''),
+            num(speed));
+    }));
 
     // sensors
 
-    prims.set('cal_sensor(name)', function (name) {
-        if (!cal.isConnected()) {return 0; }
-        switch (code(name)) {
-        case 'light':
-            return cal.lightLevel;
-        case 'temperature':
-            return cal.temperature;
-        case 'compass':
-            return cal.compassHeading;
-        case 'pitch':
-            return cal.pitch;
-        case 'roll':
-            return cal.roll;
-        case 'sound':
-            cal.ensureMic();
-            return Math.round(cal.soundLevel * 1000 / 255) / 10;
-        case 'magnetic':
-            return Math.round(Math.sqrt(
-                cal.magneticForce.x ** 2 +
-                cal.magneticForce.y ** 2 +
-                cal.magneticForce.z ** 2
-            ));
-        }
-        return 0;
+    prims.set('cal_light()', function () {
+        return percent(cal.lightLevel, 255);
     });
 
-    prims.set('cal_acceleration(axis)', function (axis) {
-        var a = cal.acceleration;
-        if (!cal.isConnected()) {return 0; }
-        axis = code(axis).toLowerCase();
-        if (axis === 'x' || axis === 'y' || axis === 'z') {
-            return Math.round(a[axis]);
-        }
-        return Math.round(Math.sqrt(a.x ** 2 + a.y ** 2 + a.z ** 2));
+    prims.set('cal_temperature()', function () {
+        return cal.temperature;
     });
 
-    prims.set('cal_magnetic(axis)', function (axis) {
-        var m = cal.magneticForce;
-        if (!cal.isConnected()) {return 0; }
-        axis = code(axis).toLowerCase();
-        if (axis === 'x' || axis === 'y' || axis === 'z') {
-            return m[axis];
-        }
-        return Math.round(Math.sqrt(m.x ** 2 + m.y ** 2 + m.z ** 2));
+    prims.set('cal_compass()', function () {
+        return cal.compassHeading;
     });
 
-    prims.set('cal_analog(pin)', function (pin) {
-        // answers 0..100 (%) or -1 while waiting for the device
-        var raw = cal.analog(pinNumber(pin));
-        return raw < 0 ? -1 : Math.round(raw * 1000 / 1024) / 10;
+    prims.set('cal_pitch()', function () {
+        return cal.pitch;
     });
+
+    prims.set('cal_roll()', function () {
+        return cal.roll;
+    });
+
+    prims.set('cal_sound()', function () {
+        if (link) {cal.ensureMic(); }
+        return cal.mic ? percent(cal.soundLevel, 255) : 0;
+    });
+
+    prims.set('cal_acceleration(axis)', function (choice) {
+        return axis(cal.acceleration, choice);
+    });
+
+    prims.set('cal_magnetic(axis)', function (choice) {
+        return axis(cal.magneticForce, choice);
+    });
+
+    prims.set('cal_analog(pin)', device(function (pin) {
+        // answers 0..100 (%), or -1 while waiting for the device
+        var raw = cal.analog(clamp(pinNumber(pin), 0, 3));
+        return raw < 0 ? -1 : percent(raw, 1024);
+    }));
 
     // pins
 
-    prims.set('cal_pull(pin, mode)', function (pin, mode) {
-        mode = code(mode).toUpperCase();
-        cal.setPull(pinNumber(pin), PULL[mode] === undefined ? 0 : PULL[mode]);
-    });
+    prims.set('cal_pull(pin, mode)', device(function (pin, mode) {
+        cal.setPull(pinNumber(pin), PULL[code(mode)] || PULL.NONE);
+    }));
 
     prims.set('cal_pin_high(pin)', function (pin) {
         pin = pinNumber(pin);
-        if (!cal.isConnected()) {return false; }
-        if (cal.config.pinMode[pin] !== 'INPUT') {
-            cal.setPull(pin, PULL.DOWN);
-        }
+        if (link) {cal.ensureInput(pin, PULL.DOWN); }
         return cal.digitalLevel[pin] === 1;
     });
 
-    prims.set('cal_digital_out(pin, level)', function (pin, level) {
-        var high = level === true || /^(true|high|hoch|an|1)$/i.test(
-            String(level).trim()
-        ) || num(level) > 0;
-        cal.setOutput(pinNumber(pin), high);
-    });
+    prims.set('cal_digital_out(pin, level)', device(function (pin, level) {
+        cal.setOutput(pinNumber(pin), level === true || num(level) > 0 ||
+            /^(true|wahr|hoch|an)$/i.test(String(level).trim()));
+    }));
 
-    prims.set('cal_analog_out(pin, percent)', function (pin, percent) {
-        var level = Math.round(clamp(num(percent), 0, 100) * 1024 / 100);
-        cal.setPWM(pinNumber(pin), level);
-    });
+    prims.set('cal_analog_out(pin, percent)', device(function (pin, value) {
+        cal.setPWM(pinNumber(pin),
+            Math.round(clamp(num(value), 0, 100) * 1024 / 100));
+    }));
 
-    prims.set('cal_servo(pin, angle)', function (pin, angle) {
+    prims.set('cal_servo(pin, angle)', device(function (pin, angle) {
         cal.setServo(pinNumber(pin), Math.round(clamp(num(angle), 0, 180)));
-    });
+    }));
 
-    prims.set('cal_listen_pin(pin, type)', function (pin, type) {
-        type = code(type).toUpperCase();
-        cal.listenPinEvent(
-            pinNumber(pin),
-            PIN_EVENT_TYPE[type] === undefined ? 0 : PIN_EVENT_TYPE[type]
-        );
-    });
+    prims.set('cal_listen_pin(pin, type)', device(function (pin, type) {
+        cal.listenPinEvent(pinNumber(pin),
+            PIN_EVENT_TYPE[code(type)] || PIN_EVENT_TYPE.NONE);
+    }));
 
     prims.set('cal_pin_event(pin, event)', function (pin, event, proc) {
         var p = pinNumber(pin),
-            id = PIN_EVENT[code(event).toUpperCase()],
+            id = PIN_EVENT[code(event)],
             e = (cal.pinEvents[p] || {})[id];
-        return isNewEvent(proc, 'pin:' + p + ':' + id, e ? e.timestamp : 0);
+        return isNewEvent(proc, 'pin:' + p + ':' + id, e ? e.stamp : 0);
     });
 
     prims.set('cal_pin_event_value(pin, event)', function (pin, event) {
-        var p = pinNumber(pin),
-            id = PIN_EVENT[code(event).toUpperCase()],
-            e = (cal.pinEvents[p] || {})[id];
+        var e = (cal.pinEvents[pinNumber(pin)] || {})[PIN_EVENT[code(event)]];
         return e ? e.value : 0;
     });
 
     // sound
 
-    prims.set('cal_tone(freq, volume)', function (freq, volume) {
+    prims.set('cal_tone(freq, volume)', device(function (freq, volume) {
         cal.playTone(num(freq, 440), num(volume, 100));
-    });
+    }));
 
-    prims.set('cal_stop_tone()', function () {
+    prims.set('cal_stop_tone()', device(function () {
         cal.stopTone();
-    });
+    }));
 
-    // stop sound and motors when the red stop sign is pressed
-    if (Process && !Process.prototype.calliopeStopHooked) {
-        Process.prototype.calliopeStopHooked = true;
-        var oldStopAll = window.IDE_Morph ?
-                window.IDE_Morph.prototype.stopAllScripts : null;
-        if (oldStopAll) {
-            window.IDE_Morph.prototype.stopAllScripts = function () {
-                if (cal.isConnected()) {
-                    cal.stopTone();
-                    cal.setMotor('m0m1', 0);
-                }
-                return oldStopAll.apply(this, arguments);
-            };
-        }
+    // the red stop sign also stops the tone and the motors
+    if (link && window.IDE_Morph) {
+        var stopAllScripts = IDE_Morph.prototype.stopAllScripts;
+        IDE_Morph.prototype.stopAllScripts = function () {
+            cal.stopTone();
+            cal.setMotor('m0m1', 0);
+            return stopAllScripts.apply(this, arguments);
+        };
     }
 }());
