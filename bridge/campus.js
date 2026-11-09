@@ -20,6 +20,7 @@
                                           and report no changes
         {type: 'snap.requestProject'}     answer with snap.changed right away
         {type: 'calliope.*'}              device messages, see calliope.js
+                                          (it listens to them itself)
 
     Snap! -> host
         {type: 'snap.ready'}              the IDE is up, waiting for snap.load
@@ -29,8 +30,8 @@
         {type: 'snap.changed', key, xml}  the project changed (debounced)
         {type: 'snap.save', key, xml}     the user saved (Ctrl+S, menu)
         {type: 'snap.runtimeVersion', runtimeVersion, hardware}
-                                          from calliope.js after a handshake
-        {type: 'calliope.*'}              device access, see calliope.js
+        {type: 'calliope.*'}              device access; both come from
+                                          calliope.js, see there
 */
 
 /*global WorldMorph, IDE_Morph, HandMorph, WorldMorph, ScriptsMorph,
@@ -108,6 +109,8 @@ SnapExtensions*/
         ide.onNextStep = null;
         ide.world().animations = [];
         ide.openProjectString(xml, () => {
+            // the new program arms its own touch pads and pin events
+            window.SnapCalliope.resetSession();
             selectCategory(CATEGORY);
             applyReadonly();
             armHats();

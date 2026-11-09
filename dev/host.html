@@ -7,7 +7,9 @@
     A stand-in for Calliope Campus, served by scripts/serve.mjs at
     /dev/host.html (not part of the build). It embeds campus.html the way
     Campus does, logs every message, and plays a Calliope mini running the
-    Blocks program: it answers calliope.read and can send button events.
+    Blocks program: it answers calliope.read, sends button events, and shows
+    what the commands would put on the mini's display and RGB LEDs. Its
+    connection signals are the ones Campus sends the Blocks editor.
 -->
 <style>
     body { margin: 0; font: 14px system-ui, sans-serif; display: grid;
@@ -16,11 +18,23 @@
     aside { border-left: 1px solid #ccc; padding: 8px; overflow: auto; }
     button { margin: 2px; }
     pre { font-size: 11px; white-space: pre-wrap; }
+    #mini { display: flex; gap: 16px; align-items: center; margin: 8px 0;
+        padding: 12px; border-radius: 12px; background: #1f2b38; color: #fff; }
+    #mini.off { opacity: .4; }
+    #leds { display: grid; grid-template-columns: repeat(5, 14px); gap: 5px; }
+    #leds i { width: 14px; height: 14px; border-radius: 3px; background: #ff3b30; }
+    #rgb { width: 22px; height: 22px; border-radius: 50%; background: #000;
+        border: 2px solid #455; }
+    #text { font: 12px monospace; min-height: 1em; }
 </style>
 </head>
 <body>
 <iframe id="snap"></iframe>
 <aside>
+    <div id="mini" class="off">
+        <div id="leds"></div>
+        <div><div id="rgb" title="RGB-LED"></div><div id="text"></div></div>
+    </div>
     <div>
         <button id="connect">Gerät verbinden</button>
         <button id="disconnect">Gerät trennen</button>
@@ -38,9 +52,41 @@
     const SERVICE = '0b50f3e4-607f-4151-9091-7d008d6ffc5c';
     const uuid = (ch) => `0b50${ch.toString(16).padStart(4, '0')}-607f-4151-9091-7d008d6ffc5c`;
     const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
+    const unb64 = (s) => Array.from(atob(s || ''), (c) => c.charCodeAt(0));
     let connected = false, readonly = false, active = true;
     const subscribed = new Set();
     window.messages = [];
+
+    // the mini: 25 LEDs, one colour for the RGB LEDs, scrolling text
+    const leds = document.getElementById('leds');
+    for (let i = 0; i < 25; i++) leds.appendChild(document.createElement('i'));
+    function showPixels(levels) {
+        levels.forEach((v, i) => { leds.children[i].style.opacity = 0.08 + 0.92 * (v / 255); });
+    }
+    showPixels(new Array(25).fill(0));
+    const half = [];
+    let touchArmed = 0, pinEventsArmed = 0; // reported in COMMAND bytes 4..7
+    function command(bytes) {
+        const cmd = bytes[0] >> 5, sub = bytes[0] & 0x1f, data = bytes.slice(1);
+        if (cmd === 2 && sub === 4) { // PIXELS_PACKED
+            const bits = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+            showPixels(Array.from({ length: 25 }, (_, i) => ((bits >> i) & 1) * 255));
+        } else if (cmd === 2 && sub === 2) { // PIXELS_0
+            half.splice(0, 15, ...data.slice(0, 15));
+        } else if (cmd === 2 && sub === 3) { // PIXELS_1
+            showPixels(half.slice(0, 15).concat(data.slice(0, 10)));
+        } else if (cmd === 2 && sub === 1) { // TEXT
+            const text = String.fromCharCode(...data.slice(1, data.indexOf(0, 1)));
+            document.getElementById('text').textContent = text;
+            if (text === 'C') showPixels([0,255,255,255,0, 255,0,0,0,0, 255,0,0,0,0, 255,0,0,0,0, 0,255,255,255,0]);
+        } else if (cmd === 0 && sub === 2) { // CONFIG TOUCH
+            touchArmed = data[1] ? touchArmed | (1 << data[0]) : touchArmed & ~(1 << data[0]);
+        } else if (cmd === 1 && sub === 5) { // PIN SET_EVENT
+            pinEventsArmed = data[1] ? pinEventsArmed | (1 << data[0]) : pinEventsArmed & ~(1 << data[0]);
+        } else if (cmd === 5) { // RGB
+            document.getElementById('rgb').style.background = `rgb(${data[0]},${data[1]},${data[2]})`;
+        }
+    }
 
     function log(dir, msg) {
         window.messages.push({ dir, msg });
@@ -54,7 +100,9 @@
     }
     function answer(ch) {
         if (!connected) return [];
-        if (ch === 0x0100) return [2, 2, 0, 2, 0]; // mini 3, protocol 2, BLE, runtime v2
+        // mini 3, protocol 2, BLE, runtime v2, armed touch pads and pin events
+        if (ch === 0x0100) return [2, 2, 0, 2, touchArmed, pinEventsArmed & 0xff,
+            (pinEventsArmed >> 8) & 0xff, (pinEventsArmed >> 16) & 0xff];
         if (ch === 0x0101) return [0, 0, 0, 0, 120, 128 + 21, 10];
         if (ch === 0x0102) return new Array(18).fill(0);
         if (ch === 0x0120) return [0, 2, 0, 1, 0, 0, 0, 0];
@@ -71,15 +119,21 @@
             frame.contentWindow.postMessage({ source: 'calliope-host', type: 'calliope.readResult',
                 reqId: msg.reqId, message: b64(answer(ch)), encoding: 'base64' }, origin);
         }
+        if (msg.type === 'calliope.write' && connected) command(unb64(msg.message));
         if (msg.type === 'calliope.subscribe') subscribed.add(msg.characteristicId);
     });
     document.getElementById('connect').onclick = () => {
         connected = true;
-        send({ type: 'calliope.connection', connected: true });
+        document.getElementById('mini').classList.remove('off');
+        // what Campus sends once the widget has connected a Blocks program
+        send({ type: 'calliope.rehandshake' });
+        send({ type: 'calliope.onConnect' });
     };
     document.getElementById('disconnect').onclick = () => {
         connected = false;
-        send({ type: 'calliope.connection', connected: false });
+        document.getElementById('mini').classList.add('off');
+        touchArmed = pinEventsArmed = 0;
+        send({ type: 'calliope.disconnect' });
     };
     document.getElementById('buttonA').onclick = window.pressA = () => {
         const data = new Array(20).fill(0);
