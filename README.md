@@ -25,12 +25,19 @@ npm run build      # downloads Snap! once into .cache/, builds into dist/
 npm run dev        # build, then serve dist/ at http://localhost:8610/
 ```
 
-- **Build command:** `npm run build`
-- **Output directory:** `dist`
+The Snap! version is `snapVersion` in `package.json`. Files over 25 MiB (the
+Snap! manual in `help/`) are left out, Cloudflare Pages does not take them.
 
-That is all a Cloudflare Pages project needs (framework preset "None"). The Snap!
-version is `snapVersion` in `package.json`. Files over 25 MiB (the Snap! manual
-in `help/`) are left out, Pages does not take them.
+## Branches and deployment
+
+Work happens on `calliope-main`. The workflow
+`.github/workflows/calliope-build.yml` builds every push to `calliope-main`
+onto the branch `build-dev` (served at `snap-dev.calliope.cc`) and every tag
+`calliope-vX.Y.Z` onto `build-live` (served at `snap.calliope.cc`), each build
+both at the branch root and under `editors/snap/`, the path Campus serves its
+editors under. A Cloudflare Pages project per build branch serves it as it is,
+without a build command. Channels, `BUILD.json` and the version line in the
+Snap! logo menu: [docs/build-info.md](docs/build-info.md).
 
 ## What `dist/` holds
 
@@ -41,6 +48,7 @@ in `help/`) are left out, Pages does not take them.
 | `render.html` | preview pictures of projects (Live Wall, program cards) |
 | `bridge/` | the scripts of both pages |
 | `index.html` | forwards to `campus.html` |
+| `BUILD.json`, `build-info.js` | which build this is ([docs/build-info.md](docs/build-info.md)) |
 
 `campus.html` and `render.html` load the scripts of the release's `snap.html`,
 without its service worker and its tracking.

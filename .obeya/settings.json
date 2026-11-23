@@ -3,6 +3,8 @@
 		"node --check calliope/calliope.js",
 		"node --check bridge/campus.js",
 		"node --check bridge/render.js",
+		"node --check bridge/version.js",
+		"node --check scripts/build-info.mjs",
 		"npm run library",
 		"git diff --exit-code -- calliope/calliope_module.xml calliope/template.xml"
 	],
