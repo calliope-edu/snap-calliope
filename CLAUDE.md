@@ -35,7 +35,22 @@ README explains the layout, the build and the message protocol.
 - After changing `bridge/`, `pages/` or `calliope/`, run `npm run build` again;
   the server serves the new files without a restart.
 
+## Branches
+
+- Work happens on `calliope-main`: branch off it and merge back into it. A tag
+  `calliope-vX.Y.Z` on `calliope-main` goes live; every push to
+  `calliope-main` goes to dev.
+- `build-live` and `build-dev` are filled only by the workflow
+  `.github/workflows/calliope-build.yml`; never commit to them by hand and
+  never rewrite them.
+- `main` is the old line; it stays only until the cards that branched off it
+  have landed, then it is merged into `calliope-main`.
+
 ## Deployment
 
-Cloudflare Pages: build command `npm run build`, output directory `dist`.
+The workflow builds once and commits the build to the build branch at its root
+and under `editors/snap/` (the path Campus serves its editors under):
+`build-live` → `snap.calliope.cc`, `build-dev` → `snap-dev.calliope.cc`, each a
+Cloudflare Pages project without a build command. `BUILD.json`, its code
+constant and the version line in the Snap! logo menu: `docs/build-info.md`.
 Campus embeds `campus.html` and `render.html` from there.
